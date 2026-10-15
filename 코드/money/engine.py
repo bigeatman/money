@@ -444,7 +444,7 @@ class Engine:
             c["state"] = "waiting_cash"
             return
         if hasattr(self.broker, "orderable"):
-            q = self.broker.orderable(market, code, ex, reservation_price)
+            q = self.broker.orderable(market, code, ex, reservation_price, buy_fee=self.fees(market)[0])
             if q is not None and c["quantity"] > q:
                 c["state"] = "waiting_broker_cash"
                 return
@@ -454,6 +454,9 @@ class Engine:
         if (current >= timestamp(c["expires_at"]) or current >= timestamp(session["cutoff"])
                 or not self.command_ready(c, timestamp(session["opens_at"]), timestamp(session["closes_at"]), current)):
             c["state"] = "expired"
+            return
+        if not timedelta(0) <= current - timestamp(quote["fetched_at"]) <= timedelta(seconds=30):
+            c["state"] = "waiting_quote"
             return
         target = str(number(c["target"]))
         self.s["targets"][k] = target
@@ -689,7 +692,10 @@ class Engine:
                 return {"as_of": self.clock().isoformat(), "mode": self.broker.mode, "market": "KR",
                     "part": part, "api": "kt00018/kt00001/ka10001/ka10004",
                     "data": self.snapshot("KR", [{"symbol": "010140", "exchange": "KRX"}], False)}
-            if part == "quote":
+            if part == "buying_power":
+                data = self.broker.us_cash_buying_power(self.fees("US")[0])
+                api = "ust21050/ust21110"
+            elif part == "quote":
                 data = self.broker.quote("US", "MSFT", "ND")
                 api = "usa20100/usa20101"
             elif part == "orders":

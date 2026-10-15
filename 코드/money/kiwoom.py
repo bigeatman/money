@@ -44,6 +44,7 @@ class KiwoomBroker:
         self.last_request = 0.0
         self.lock = threading.RLock()
         self.us_history_verified = None
+        self.us_buying_power_verified = None
 
     def binding(self):
         return {m: hashlib.sha256(os.environ[f"KIWOOM_{m}_APPKEY"].encode()).hexdigest()
@@ -232,12 +233,75 @@ class KiwoomBroker:
                 "complete": not errors and positions is not None and available_cash is not None and fx is not None,
                 "errors": errors, "observed_at": observed, "raw": clean(raw), "mode": self.mode}
 
-    def orderable(self, market, code, exchange, price):
+    def us_cash_buying_power(self, buy_fee=Decimal(0)):
+        """Conservative USD cash ceiling, not the unsupported ust31490 quantity.
+
+        Withdrawable cash can be lower than buying power because unsettled sale
+        proceeds are excluded. Reserve all pending buys again deliberately; a
+        broker may already have reserved some of that cash. Never use margin,
+        automatic FX, unfilled sale proceeds or missing fields as spendable cash.
+        """
+        self.us_buying_power_verified = None
+        if self.mode != "kiwoom-demo" or MOCK_URL != "https://mockapi.kiwoom.com":
+            raise ValueError("cash-only buying power requires the Kiwoom mock server")
+        fee = number(buy_fee, signed=True)
+        if not 0 <= fee < 1:
+            raise ValueError("invalid buy fee")
+        pending = self.call("US", "ust21050", "/api/us/acnt",
+                            {"ord_dt": "", "slby_tp": "0"}, pages=True)
+        reserve, seen = Decimal(0), {}
+        for row in rows(pending, aliases=("result_lsit",)):
+            parsed = self._us_order_row(row, "ust21050")
+            oid = order_key(row["ord_no"])
+            if not oid or oid == "0":
+                raise ValueError("pending US order has no stable order number")
+            if parsed["status"] == "unconfirmed":
+                raise ValueError("pending US order has an unconfirmed remainder")
+            amount = Decimal(0)
+            if parsed["side"] == "BUY" and parsed["remaining"]:
+                if row.get("crnc_code") != "USD" or row.get("frgn_trde_tp") != "00":
+                    raise ValueError("cannot bound a non-USD or non-limit pending buy")
+                price = number(row["ord_uv"], signed=True)
+                if price <= 0:
+                    raise ValueError("pending US buy has no positive limit price")
+                amount = price * parsed["remaining"] * (1 + fee)
+            fingerprint = (parsed["symbol"], parsed["side"], parsed["qty"],
+                           parsed["filled"], parsed["remaining"], amount)
+            if oid in seen:
+                if seen[oid] != fingerprint:
+                    raise ValueError("conflicting duplicate pending US order")
+                continue
+            seen[oid] = fingerprint
+            reserve += amount
+        cash = self.call("US", "ust21110", "/api/us/acnt", {}, pages=True)
+        usd_rows = [r for r in rows(cash) if r.get("crnc_code") == "USD"]
+        if len(usd_rows) != 1:
+            raise ValueError("exactly one USD cash row is required")
+        usd = usd_rows[0]
+        for source, fields in ((cash, ("ch_uncla", "etc_loana")),
+                (usd, ("fc_ch_uncla", "fc_etc_loana", "futr_repl_profa", "futr_profa_booka"))):
+            if any(number(source[field], signed=True) != 0 for field in fields):
+                raise ValueError("cash-only US buys require zero debt and collateral")
+        ceiling = max(Decimal(0), min(number(usd[field], signed=True)
+                      for field in ("fc_entra", "fc_pymn_alowa", "fc_ord_alowa")))
+        result = {"method": "conservative_usd_cash", "cash_api": "ust21110",
+                  "pending_api": "ust21050", "observed_at": now().isoformat(),
+                  "cash_ceiling_usd": str(ceiling), "pending_buy_reserve_usd": str(reserve),
+                  "available_usd": str(max(Decimal(0), ceiling - reserve)), "buy_fee": str(fee),
+                  "note": "calculated cash ceiling, not broker-confirmed min_ord_alowq; pending cash may be reserved twice"}
+        self.us_buying_power_verified = result
+        return result
+
+    def orderable(self, market, code, exchange, price, *, buy_fee=Decimal(0)):
         if market == "KR":
             return None  # Account cash was queried at 100% cash margin above.
-        data = self.call(market, "ust31490", "/api/us/ordr",
-                         {"stex_tp": exchange, "stk_cd": code, "uv": str(price)})
-        return quantity(data["min_ord_alowq"])  # Explicit no-credit buying quantity.
+        if market != "US":
+            raise ValueError("unsupported market")
+        limit, fee = number(price, signed=True), number(buy_fee, signed=True)
+        if limit <= 0 or not 0 <= fee < 1:
+            raise ValueError("invalid US limit price or buy fee")
+        power = self.us_cash_buying_power(fee)
+        return int(Decimal(power["available_usd"]) // (limit * (1 + fee)))
 
     def quote(self, market, code, exchange):
         if market == "KR":
@@ -370,6 +434,7 @@ class KiwoomBroker:
                 "amount_basis": "broker cumulative amount" if r.get("cntr_amt") not in (None, "") else "reported fill price times filled quantity; rounding possible"}
 
     def execution_capabilities(self):
-        return {"adapter_version": "us-demo-v3", "us_history_api": "ust21510", "us_pending_api": "ust21050",
+        return {"adapter_version": "us-demo-v6", "us_history_api": "ust21510", "us_pending_api": "ust21050",
                 "us_history_verified": self.us_history_verified, "us_history_today_only": True,
+                "us_buying_power_method": "conservative_usd_cash", "us_buying_power_verified": self.us_buying_power_verified,
                 "notional_basis": "reported fill price times quantity unless cumulative amount is supplied; fee estimates separate"}
