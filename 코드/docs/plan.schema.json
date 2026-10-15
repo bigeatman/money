@@ -1,0 +1,120 @@
+{
+  "type": "object",
+  "properties": {
+    "plan_id": {
+      "type": "string"
+    },
+    "market": {
+      "type": "string",
+      "enum": [
+        "KR",
+        "US"
+      ]
+    },
+    "generated_at": {
+      "type": "string"
+    },
+    "expires_at": {
+      "type": "string"
+    },
+    "session": {
+      "type": "object",
+      "properties": {
+        "opens_at": {
+          "type": "string"
+        },
+        "closes_at": {
+          "type": "string"
+        },
+        "calendar_sources": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        }
+      },
+      "required": [
+        "opens_at",
+        "closes_at",
+        "calendar_sources"
+      ],
+      "additionalProperties": false
+    },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "BUY",
+              "SELL",
+              "REPRICE",
+              "HOLD",
+              "CANCEL"
+            ]
+          },
+          "symbol": {
+            "type": "string"
+          },
+          "exchange": {
+            "type": "string",
+            "enum": [
+              "KRX",
+              "NY",
+              "ND",
+              "NA"
+            ]
+          },
+          "quantity": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "buy_limit": {
+            "type": "string"
+          },
+          "preopen": {
+            "type": "boolean",
+            "description": "BUY only: opt in to the KRX 30-minute opening auction; expires at regular open."
+          },
+          "order_type": {
+            "type": "string",
+            "enum": [
+              "LIMIT",
+              "MARKET"
+            ],
+            "description": "Default LIMIT. MARKET requires preopen=true; buy_limit must cover today's exchange upper_limit for cash reservation, not a broker limit price."
+          },
+          "target": {
+            "type": "string"
+          },
+          "order_ref": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action",
+          "symbol",
+          "exchange",
+          "reason"
+        ],
+        "additionalProperties": false
+      },
+      "maxItems": 30
+    }
+  },
+  "required": [
+    "plan_id",
+    "market",
+    "generated_at",
+    "expires_at",
+    "session",
+    "actions"
+  ],
+  "additionalProperties": false
+}

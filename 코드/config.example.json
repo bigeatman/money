@@ -1,0 +1,14 @@
+{
+  "capital_krw": "1000000",
+  "max_positions": 10,
+  "poll_seconds": 5,
+  "close_buffer_minutes": {"KR": 15, "US": 5},
+  "fees": {
+    "KR": {"buy": "0.0035", "sell": "0.0035", "sell_tax": "0.0020"},
+    "US": {"buy": "0.0025", "sell": "0.0025", "sell_tax": "0.0001"}
+  },
+  "allowed_origins": ["https://chatgpt.com", "https://chat.openai.com"],
+  "host": "127.0.0.1",
+  "port": 8765,
+  "broker": "paper"
+}
