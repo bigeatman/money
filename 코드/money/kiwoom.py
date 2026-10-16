@@ -45,6 +45,8 @@ class KiwoomBroker:
         self.lock = threading.RLock()
         self.us_history_verified = None
         self.us_buying_power_verified = None
+        self._catalog_gate = threading.Lock()
+        self._catalog_at = None
 
     def binding(self):
         return {m: hashlib.sha256(os.environ[f"KIWOOM_{m}_APPKEY"].encode()).hexdigest()
@@ -160,6 +162,98 @@ class KiwoomBroker:
         if not data.get("ord_no"):
             raise ValueError("order response has no order number; outcome unknown")
         return str(data["ord_no"])
+
+    def scan_page(self, market, api, path, body, cursor=""):
+        """One read-only page. Never hold the engine lock during a market scan.
+
+        usa10099 permits only five requests/minute; its wait happens OUTSIDE the
+        broker lock so fills/cancellations can still be reconciled. Catalog
+        transport/token failures are not retried inside that rate window.
+        """
+        allowed = {
+            "ka10099": ("KR", "/api/dostk/stkinfo"), "ka10095": ("KR", "/api/dostk/stkinfo"),
+            "ka10081": ("KR", "/api/dostk/chart"), "ka10080": ("KR", "/api/dostk/chart"),
+            "usa10099": ("US", "/api/us/stkinfo"), "usa20570": ("US", "/api/us/stkinfo"),
+            "usa10101": ("US", "/api/us/stkinfo"),
+            "usa20530": ("US", "/api/us/rkinfo"), "usa20100": ("US", "/api/us/mrkcond"),
+            "usa06012": ("US", "/api/us/chart"), "usa06011": ("US", "/api/us/chart")}
+        if allowed.get(api) != (market, path):
+            raise ValueError("scan_page accepts only documented read-only market-data APIs")
+        if api == "usa10099":
+            with self._catalog_gate:
+                if self._catalog_at is not None:
+                    delay = 12.1 - (time.monotonic() - self._catalog_at)
+                    if delay > 0:
+                        time.sleep(delay)
+                try:
+                    return self._scan_page(market, api, path, body, cursor, catalog=True)
+                finally:
+                    self._catalog_at = time.monotonic()
+        return self._scan_page(market, api, path, body, cursor)
+
+    def _scan_page(self, market, api, path, body, cursor, catalog=False):
+        with self.lock:
+            headers = {"Content-Type": "application/json;charset=UTF-8", "api-id": api,
+                       "authorization": "Bearer " + self._token(market)}
+            if cursor:
+                headers.update({"cont-yn": "Y", "next-key": cursor})
+            try:
+                request = self._http if catalog else self._request
+                data, response_headers = request(path, body, headers)
+                code = str(data.get("return_code", "missing"))
+                invalid = code == "8005" or code == "3" and "8005" in str(data.get("return_msg", ""))
+                if invalid:
+                    self.tokens.pop(market, None)
+                    if not catalog:
+                        headers["authorization"] = "Bearer " + self._token(market)
+                        data, response_headers = self._request(path, body, headers)
+                        code = str(data.get("return_code", "missing"))
+                if code != "0":
+                    raise Rejected(self._failure(api, data))
+                return data, response_headers
+            except HTTPError as exc:
+                raise ValueError(f"market-data HTTP {exc.code}: {api}") from exc
+
+    def market_context(self, market, instruments, interval=60):
+        """Daily/hourly first-page evidence; partial history stays explicit."""
+        from .common import symbol
+        if market not in {"KR", "US"} or isinstance(interval, bool) or interval not in {30, 60}:
+            raise ValueError("market KR/US and interval 30/60 are required")
+        if not isinstance(instruments, list) or not 1 <= len(instruments) <= 5:
+            raise ValueError("request 1..5 context instruments per batch")
+        zone = ZoneInfo("Asia/Seoul" if market == "KR" else "America/New_York")
+        date = now().astimezone(zone).strftime("%Y%m%d")
+        result = []
+        for item in instruments:
+            code, exchange = item["symbol"], item["exchange"]
+            symbol(market, code, exchange)
+            if market == "KR":
+                queries = [("daily", "ka10081", {"stk_cd": code, "base_dt": date, "upd_stkpc_tp": "1"},
+                            "stk_dt_pole_chart_qry"),
+                           ("intraday", "ka10080", {"stk_cd": code, "base_dt": date,
+                            "tic_scope": str(interval), "upd_stkpc_tp": "1"}, "stk_min_pole_chart_qry")]
+                path = "/api/dostk/chart"
+            else:
+                base = {"stex_tp": exchange, "stk_cd": code, "strt_dt": date,
+                        "upd_stkpc_tp": "1", "exrt_appl_tp": "0"}
+                queries = [("daily", "usa06012", base, "result_list"),
+                           ("intraday", "usa06011", dict(base, tic_scope=str(interval)), "result_list")]
+                path = "/api/us/chart"
+            out = dict(item, market=market, errors={})
+            for name, api, body, table in queries:
+                try:
+                    data, h = self.scan_page(market, api, path, body)
+                    bars = rows(data, table)
+                    out[name] = {"api": api, "received_at": now().isoformat(), "bars": bars[:200],
+                        "interval_minutes": None if name == "daily" else interval,
+                        "complete_history": False, "first_page_only": True,
+                        "returned_rows": len(bars[:200]), "provider_page_rows": len(bars),
+                        "provider_has_more": {k.lower(): v for k, v in h.items()}.get("cont-yn") == "Y",
+                        "completion_note": "Raw timestamps retained. Exclude the current day/in-progress bar after verifying provider time semantics; no bar is asserted completed here."}
+                except Exception as exc:
+                    out["errors"][name] = {"error": type(exc).__name__, "message": str(exc)}
+            result.append(out)
+        return {"market": market, "as_of": now().isoformat(), "instruments": result}
 
     def cancel(self, market, code, exchange, oid):
         body = {"stk_cd": code, "orig_ord_no": oid}

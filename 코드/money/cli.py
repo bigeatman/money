@@ -14,6 +14,7 @@ from .engine import Engine
 from .kiwoom import KiwoomBroker
 from .paper import PaperBroker
 from .server import make_server
+from .scanner import MarketScanner, UnavailableScanner
 from .store import Store
 
 
@@ -89,7 +90,13 @@ def main():
         raise SystemExit("another executor owns this ledger; use HTTP /status or /plan")
     store = Store(runtime / "state.sqlite", config["capital_krw"])
     broker = KiwoomBroker() if config["broker"] == "kiwoom-demo" else PaperBroker()
-    engine = Engine(store, broker, config)
+    scanner = None
+    if config["broker"] == "kiwoom-demo":
+        try:
+            scanner = MarketScanner(broker, runtime / "market-scans", config.get("market_scan"))
+        except (OSError, ValueError) as exc:
+            scanner = UnavailableScanner(exc)
+    engine = Engine(store, broker, config, scanner=scanner)
     if args.command == "status":
         print(json.dumps(engine.status(), ensure_ascii=False, indent=2))
         store.close()
@@ -110,9 +117,13 @@ def main():
     print(f"Executor running on loopback port {config['port']}; broker={broker.mode}; capital={config['capital_krw']} KRW", flush=True)
     try:
         while not stop.is_set():
+            if scanner is not None:
+                scanner.heartbeat()
             engine.tick()
             stop.wait(max(1, float(config["poll_seconds"])))
     finally:
+        if scanner is not None:
+            scanner.close()
         server.shutdown()
         with engine.lock:
             store.save()

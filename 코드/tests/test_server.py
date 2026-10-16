@@ -43,7 +43,9 @@ class ServerTests(unittest.TestCase):
                            "params": {"protocolVersion": "2025-06-18"}})
         self.assertEqual(data["result"]["protocolVersion"], "2025-06-18")
         _, data = self.rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
-        self.assertEqual(len(data["result"]["tools"]), 3)
+        self.assertEqual({t["name"] for t in data["result"]["tools"]},
+                         {"get_trading_snapshot", "submit_trading_plan", "get_execution_status",
+                          "start_market_scan", "get_market_scan", "get_market_context"})
         _, data = self.rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                            "params": {"name": "get_execution_status", "arguments": {}}})
         self.assertFalse(data["result"]["isError"])
@@ -86,6 +88,22 @@ class ServerTests(unittest.TestCase):
             self.assertFalse(data["ok"])
             self.assertIn("ust21120", data["message"])
         self.assertFalse(self.store.state["orders"])
+
+    def test_new_scan_and_context_tools_route_read_only_calls(self):
+        cases = [
+            ("start_market_scan", {"market": "KR", "force": True}, "market_scan", ("KR", True)),
+            ("get_market_scan", {"market": "KR", "offset": 100, "limit": 10}, "market_scan_report",
+             ("KR", None, "all", 100, 10)),
+            ("get_market_context", {"market": "US", "instruments": [{"symbol": "MSFT", "exchange": "ND"}], "interval": 30},
+             "market_context", ("US", [{"symbol": "MSFT", "exchange": "ND"}], 30))]
+        for name, args, method, expected in cases:
+            with self.subTest(name=name), patch.object(self.engine, method, return_value={"read_only": True}) as read:
+                _, result = self.rpc({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                                     "params": {"name": name, "arguments": args}})
+                self.assertFalse(result["result"]["isError"])
+                read.assert_called_once_with(*expected)
+        self.assertFalse(self.store.state["orders"])
+        self.assertFalse(self.store.state["plans"])
 
 
 if __name__ == "__main__":

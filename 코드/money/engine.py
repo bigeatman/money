@@ -13,11 +13,12 @@ ACTIVE = {"sending", "unknown", "open", "cancel_requested"}
 
 
 class Engine:
-    def __init__(self, store, broker, config, clock=now):
+    def __init__(self, store, broker, config, clock=now, scanner=None):
         self.store, self.broker, self.config, self.clock = store, broker, config, clock
         self.s = store.state
         self.lock = threading.RLock()
         self.accounts = {}
+        self.scanner = scanner
         self.s.setdefault("targets", {})
         binding = {"mode": broker.mode, "accounts": broker.binding() if hasattr(broker, "binding") else {}}
         old_binding = self.s.get("binding")
@@ -159,6 +160,10 @@ class Engine:
                 checked.append(a)
             if len(buy_symbols) > self.config["max_positions"]:
                 raise ValueError("too many BUY instruments")
+            if self.scanner is not None:
+                for a in checked:
+                    if a["action"] == "BUY":
+                        a["market_scan_id"] = self.scanner.require_complete(market, a["symbol"], a["exchange"])
             self.s["sessions"][market] = dict(session, cutoff=cutoff.isoformat())
             if new_session:
                 # Holdings and explicit exit intents survive a session change.
@@ -381,6 +386,13 @@ class Engine:
         if self.s["paused"] or self.unknown():
             c["state"] = "blocked"
             return
+        if self.scanner is not None:
+            try:
+                c["market_scan_id"] = self.scanner.require_complete(market, code, ex)
+                c.pop("scan_block_reason", None)
+            except ValueError as exc:
+                c.update(state="waiting_market_scan", scan_block_reason=str(exc))
+                return
         if market == "US" and hasattr(self.broker, "execution_capabilities"):
             current_date = self.clock().astimezone(ZoneInfo("America/New_York")).strftime("%Y%m%d")
             verified = self.broker.execution_capabilities().get("us_history_verified")
@@ -458,6 +470,12 @@ class Engine:
         if not timedelta(0) <= current - timestamp(quote["fetched_at"]) <= timedelta(seconds=30):
             c["state"] = "waiting_quote"
             return
+        if self.scanner is not None:
+            try:
+                c["market_scan_id"] = self.scanner.require_complete(market, code, ex)
+            except ValueError as exc:
+                c.update(state="waiting_market_scan", scan_block_reason=str(exc))
+                return
         target = str(number(c["target"]))
         self.s["targets"][k] = target
         if p:
@@ -621,6 +639,11 @@ class Engine:
             self.store.save()
 
     def snapshot(self, market, instruments=None, include_charts=True):
+        if self.scanner is not None:
+            try:
+                self.scanner.start(market)  # Never waits for the census.
+            except (OSError, ValueError):
+                pass  # Scan failure cannot prevent account/holding reads.
         with self.lock:
             if market not in {"KR", "US"}:
                 raise ValueError("invalid market")
@@ -666,10 +689,28 @@ class Engine:
                 "account_complete": account.get("complete", True),
                 "execution_capabilities": self.execution_capabilities(),
                 "paused_new_buys": self.s["paused"] or account.get("complete") is False or reconciliation_error is not None,
-                "unknown_order_outcome": self.unknown()}
+                "unknown_order_outcome": self.unknown(),
+                "market_scan": self.scanner.report(market, limit=100) if self.scanner is not None else
+                               {"market": market, "status": "not_configured", "data_complete": False}}
+
+    def market_scan(self, market, force=False):
+        if self.scanner is None:
+            raise ValueError("market scanner is not configured")
+        return self.scanner.start(market, force)
+
+    def market_scan_report(self, market, scan_id=None, view="all", offset=0, limit=100):
+        if self.scanner is None:
+            raise ValueError("market scanner is not configured")
+        return self.scanner.report(market, scan_id, view, offset, limit)
+
+    def market_context(self, market, instruments, interval=60):
+        if not hasattr(self.broker, "market_context"):
+            raise ValueError("daily/hourly market context is unavailable for this broker")
+        return self.broker.market_context(market, instruments, interval)
 
     def execution_capabilities(self):
         caps = dict(self.broker.execution_capabilities()) if hasattr(self.broker, "execution_capabilities") else {}
+        caps["market_scanner"] = self.scanner.capabilities() if self.scanner is not None else {"supported": False}
         caps["kr_preopen_buys"] = {"supported": True, "exchange": "KRX", "minutes_before_open": 30,
             "order_types": ["LIMIT", "MARKET"], "opt_in": "preopen=true",
             "market_reservation": "daily upper_limit times quantity including buy fees; buy_limit must cover upper_limit",
@@ -722,4 +763,6 @@ class Engine:
                 "available_krw": str(self.available()), "positions": self.s["positions"],
                 "orders": self.s["orders"], "commands": self.s["commands"],
                 "events": self.s["events"][-50:], "paused": self.s["paused"], "unknown": self.unknown(),
-                "execution_capabilities": self.execution_capabilities()}
+                "execution_capabilities": self.execution_capabilities(),
+                "market_scans": {market: self.scanner.report(market, limit=1) for market in ("KR", "US")}
+                                if self.scanner is not None else {}}

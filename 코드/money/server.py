@@ -34,6 +34,21 @@ PLAN = {"type": "object", "properties": {
 
 def tools():
     return [
+        {"name": "start_market_scan", "description": "Start or reuse an asynchronous full-market KR/US inventory and common-data scan. No trades. Complete inventory precedes quote filtering; no top-N universe. Poll get_market_scan. force=true retries a finished incomplete scan, never overlaps an active job.",
+         "inputSchema": {"type": "object", "properties": {"market": {"type": "string", "enum": ["KR", "US"]},
+             "force": {"type": "boolean"}}, "required": ["market"], "additionalProperties": False},
+         "annotations": {"readOnlyHint": True, "openWorldHint": True, "idempotentHint": True}},
+        {"name": "get_market_scan", "description": "Read scan progress, N/E/U/V/D, errors and paged per-stock observations, policy exclusions, price/activity signals and waiting/event-review rows. Follow next_offset until null; a page size is not a candidate cap. data_complete is data collection only, not completed AI selection. Require usable_for_new_buys and do the investment review before BUY.",
+         "inputSchema": {"type": "object", "properties": {"market": {"type": "string", "enum": ["KR", "US"]},
+             "scan_id": {"type": "string"}, "view": {"type": "string", "enum": ["all", "candidate", "waiting", "data_missing", "excluded"]},
+             "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 500}},
+             "required": ["market"], "additionalProperties": False},
+         "annotations": {"readOnlyHint": True, "openWorldHint": False}},
+        {"name": "get_market_context", "description": "Read daily and 30/60-minute first-page chart evidence for up to five candidates or holdings. Raw source timestamps, in-progress-bar uncertainty and partial-history flags are retained. It does not assert a bar is complete or submit trades. Holdings may be analyzed even while the market census is incomplete.",
+         "inputSchema": {"type": "object", "properties": {"market": {"type": "string", "enum": ["KR", "US"]},
+             "instruments": {"type": "array", "items": INSTRUMENT, "minItems": 1, "maxItems": 5},
+             "interval": {"type": "integer", "enum": [30, 60]}}, "required": ["market", "instruments"], "additionalProperties": False},
+         "annotations": {"readOnlyHint": True, "openWorldHint": True}},
         {"name": "get_trading_snapshot", "description": "Read current Kiwoom DEMO cash, bot-owned shares, pending orders, order books, daily reference/upper/lower limits and 5-minute chart bars. Always call before a trading decision. External holdings are not bot-owned. Missing/stale data means no new buy; zero top-of-book during the KRX opening auction is expected when fresh daily reference/limits are available.",
          "inputSchema": {"type": "object", "properties": {"market": {"type": "string", "enum": ["KR", "US"]},
              "instruments": {"type": "array", "items": INSTRUMENT, "maxItems": 10},
@@ -131,8 +146,8 @@ def make_server(engine, token, host="127.0.0.1", port=8765, allowed_origins=()):
                     requested = params.get("protocolVersion", "2025-06-18")
                     selected = requested if requested in {"2025-03-26", "2025-06-18"} else "2025-06-18"
                     result = {"protocolVersion": selected, "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "money-demo-executor", "version": "0.2.0"},
-                        "instructions": "Demo trading only. Read snapshot before decisions. Keep shared KR+US KRW 1,000,000 including fees. KRX opening-auction BUY supports preopen=true with LIMIT or MARKET; MARKET buy_limit must cover the fetched daily upper_limit, not last price. Unsent auction buys expire at regular open. Regular buys still require live bid/ask. Never invent prices/probabilities. No opportunity means actions=[]. Check actual status after submitting."}
+                        "serverInfo": {"name": "money-demo-executor", "version": "0.3.0"},
+                        "instructions": "Demo trading only. Read snapshot before decisions. Start/reuse a full-market scan and poll get_market_scan; follow every next_offset for candidates and waiting/event-review rows. Collection completeness is not completed AI investment review. Incomplete/missing data is unfinished selection, never no opportunities: defer new BUY while continuing all holding/SELL/REPRICE management. New BUY requires fresh complete full-market inputs and a separate investment decision. Keep shared KR+US KRW 1,000,000 including fees. KRX opening-auction BUY supports preopen=true with LIMIT or MARKET; MARKET buy_limit must cover the fetched daily upper_limit. Unsent auction buys expire at regular open. Regular buys require live bid/ask. Never invent prices/probabilities/RVOL. No forced liquidation at close or date rollover. Check actual status after submitting."}
                 elif method == "ping":
                     result = {}
                 elif method == "tools/list":
@@ -142,6 +157,13 @@ def make_server(engine, token, host="127.0.0.1", port=8765, allowed_origins=()):
                     try:
                         if name == "get_trading_snapshot":
                             result_data = engine.snapshot(args["market"], args.get("instruments"), args.get("include_charts", True))
+                        elif name == "start_market_scan":
+                            result_data = engine.market_scan(args["market"], args.get("force", False))
+                        elif name == "get_market_scan":
+                            result_data = engine.market_scan_report(args["market"], args.get("scan_id"), args.get("view", "all"),
+                                args.get("offset", 0), args.get("limit", 100))
+                        elif name == "get_market_context":
+                            result_data = engine.market_context(args["market"], args["instruments"], args.get("interval", 60))
                         elif name == "submit_trading_plan":
                             result_data = engine.submit(args["plan"])
                         elif name == "get_execution_status":

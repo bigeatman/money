@@ -1,6 +1,14 @@
 {
   "capital_krw": "1000000",
   "max_positions": 10,
+  "market_scan": {
+    "batch_size": 50,
+    "max_pages": 10000,
+    "max_collection_seconds": 1800,
+    "max_quote_age_seconds": 1800,
+    "activity_acceleration_ratio": "1.5",
+    "retained_scans_per_market": 3
+  },
   "poll_seconds": 5,
   "close_buffer_minutes": {"KR": 15, "US": 5},
   "fees": {

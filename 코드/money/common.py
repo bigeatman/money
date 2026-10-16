@@ -36,7 +36,7 @@ def quantity(value):
 
 
 def symbol(market, code, exchange):
-    if market == "KR" and exchange == "KRX" and re.fullmatch(r"[0-9]{6}", code):
+    if market == "KR" and exchange == "KRX" and re.fullmatch(r"[0-9A-Z]{6}", code):
         return
     if market == "US" and exchange in {"NY", "ND", "NA"} and re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,14}", code):
         return
