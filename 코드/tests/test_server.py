@@ -45,7 +45,8 @@ class ServerTests(unittest.TestCase):
         _, data = self.rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         self.assertEqual({t["name"] for t in data["result"]["tools"]},
                          {"get_trading_snapshot", "submit_trading_plan", "get_execution_status",
-                          "start_market_scan", "get_market_scan", "get_market_context"})
+                          "start_market_scan", "get_market_scan", "get_market_context",
+                          "start_fundamental_sync", "get_fundamentals", "get_fundamental_evidence"})
         _, data = self.rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                            "params": {"name": "get_execution_status", "arguments": {}}})
         self.assertFalse(data["result"]["isError"])
@@ -100,6 +101,22 @@ class ServerTests(unittest.TestCase):
             with self.subTest(name=name), patch.object(self.engine, method, return_value={"read_only": True}) as read:
                 _, result = self.rpc({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
                                      "params": {"name": name, "arguments": args}})
+                self.assertFalse(result["result"]["isError"])
+                read.assert_called_once_with(*expected)
+        self.assertFalse(self.store.state["orders"])
+        self.assertFalse(self.store.state["plans"])
+
+    def test_fundamental_tools_are_read_only_and_route_paged_cache_queries(self):
+        cases = [
+            ("start_fundamental_sync", {}, "start_fundamental_sync", ()),
+            ("get_fundamentals", {"symbol": "005930", "after_seq": 4, "through_seq": 9, "limit": 2},
+             "fundamental_report", ("005930", 4, 0, 2, 9)),
+            ("get_fundamental_evidence", {"source_key": "change:9", "offset": 8, "limit": 90},
+             "fundamental_evidence", ("change:9", 8, 90))]
+        for name, args, method, expected in cases:
+            with self.subTest(name=name), patch.object(self.engine, method, return_value={"read_only": True}) as read:
+                _, result = self.rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": name, "arguments": args}})
                 self.assertFalse(result["result"]["isError"])
                 read.assert_called_once_with(*expected)
         self.assertFalse(self.store.state["orders"])

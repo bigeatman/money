@@ -7,6 +7,7 @@ from pathlib import Path
 import secrets
 import shutil
 import signal
+import sqlite3
 import threading
 import time
 
@@ -16,6 +17,7 @@ from .paper import PaperBroker
 from .server import make_server
 from .scanner import MarketScanner, UnavailableScanner
 from .store import Store
+from .fundamentals import Fundamentals, UnavailableFundamentals
 
 
 def load_env(path):
@@ -25,16 +27,22 @@ def load_env(path):
         line = raw.strip()
         if line and not line.startswith("#"):
             k, v = line.split("=", 1)
-            if k.startswith(("MONEY_", "KIWOOM_")):
+            if k.startswith(("MONEY_", "KIWOOM_", "OPENDART_")):
                 os.environ.setdefault(k, v.strip())
 
 
 def main():
     p = argparse.ArgumentParser(description="Work analysis → Termux Kiwoom DEMO execution")
-    p.add_argument("command", choices=["init", "credentials", "run", "import-plan", "status", "mcp-url"])
+    p.add_argument("command", choices=["init", "credentials", "run", "import-plan", "status", "mcp-url",
+        "dart-credentials", "dart-sync", "dart-status", "dart-show", "dart-export"])
     p.add_argument("--root", default=".")
     p.add_argument("--market", choices=["KR", "US"])
     p.add_argument("--file")
+    p.add_argument("--symbol")
+    p.add_argument("--after-seq", type=int)
+    p.add_argument("--through-seq", type=int)
+    p.add_argument("--offset", type=int, default=0)
+    p.add_argument("--limit", type=int, default=20)
     p.add_argument("--public-origin", help="HTTPS tunnel origin, e.g. https://your-private-host.example")
     args = p.parse_args()
     root = Path(args.root).resolve()
@@ -50,6 +58,21 @@ def main():
             envfile.write_text("MONEY_BRIDGE_TOKEN=" + secrets.token_urlsafe(48) + "\n")
             envfile.chmod(0o600)
         print("Created local configuration. Default broker=paper (offline).")
+        return
+    if args.command == "dart-credentials":
+        if not envfile.exists():
+            raise SystemExit("run init first")
+        key = getpass.getpass("OpenDART API key: ").strip()
+        if len(key) != 40 or not key.isascii() or not key.isalnum():
+            raise SystemExit("a 40-character alphanumeric OpenDART key is required")
+        lines = [line for line in envfile.read_text().splitlines() if line.partition("=")[0].strip() != "OPENDART_API_KEY"]
+        stage = envfile.with_suffix(".tmp")
+        fd = os.open(stage, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            stream.write("\n".join(lines + ["OPENDART_API_KEY=" + key]) + "\n")
+        os.replace(stage, envfile)
+        print("OpenDART key saved locally; restart the daemon to use it.")
         return
     if args.command == "credentials":
         if not args.market:
@@ -79,6 +102,22 @@ def main():
     if not configfile.exists():
         raise SystemExit("run init first")
     config = json.loads(configfile.read_text())
+    if args.command.startswith("dart-"):
+        dart = Fundamentals(root / "runtime" / "fundamentals.sqlite", config.get("opendart"))
+        if args.command == "dart-sync":
+            result = dart.sync()
+        elif args.command == "dart-status":
+            result = dart.status()
+        elif args.command == "dart-export":
+            if not args.file:
+                raise SystemExit("--file DESTINATION.sqlite is required")
+            result = dart.export(args.file)
+        else:
+            result = dart.report(args.symbol, args.after_seq, args.offset, args.limit, args.through_seq)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if args.command == "dart-sync" and result["status"] in {"failed", "paused"}:
+            raise SystemExit(1)
+        return
     if config["broker"] not in {"paper", "kiwoom-demo"}:
         raise SystemExit("Only offline paper or Kiwoom DEMO is supported")
     runtime = root / "runtime"
@@ -96,7 +135,11 @@ def main():
             scanner = MarketScanner(broker, runtime / "market-scans", config.get("market_scan"))
         except (OSError, ValueError) as exc:
             scanner = UnavailableScanner(exc)
-    engine = Engine(store, broker, config, scanner=scanner)
+    try:
+        dart = Fundamentals(runtime / "fundamentals.sqlite", config.get("opendart"))
+    except (OSError, ValueError, sqlite3.Error):
+        dart = UnavailableFundamentals()
+    engine = Engine(store, broker, config, scanner=scanner, fundamentals=dart)
     if args.command == "status":
         print(json.dumps(engine.status(), ensure_ascii=False, indent=2))
         store.close()
@@ -119,9 +162,14 @@ def main():
         while not stop.is_set():
             if scanner is not None:
                 scanner.heartbeat()
+            try:
+                dart.heartbeat()
+            except (OSError, ValueError, sqlite3.Error):
+                pass  # Read-only issuer research never interrupts order management.
             engine.tick()
             stop.wait(max(1, float(config["poll_seconds"])))
     finally:
+        dart.close()
         if scanner is not None:
             scanner.close()
         server.shutdown()
