@@ -8,6 +8,7 @@ import subprocess
 import zlib
 
 TARGETS = ["money/common.py", "money/engine.py", "money/kiwoom.py", "money/server.py", "money/cli.py",
+           "money/dart_client.py", "money/dart_data.py", "money/fundamentals.py", "tests/test_fundamentals.py",
            "money/marketdata.py", "money/scanner.py", "tests/test_server.py", "tests/test_scanner.py",
            "tests/test_scanner_installer.py", "scripts/build_scanner_installer.py", "scripts/scanner_installer_template.py"]
 
