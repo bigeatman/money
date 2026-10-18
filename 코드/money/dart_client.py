@@ -13,6 +13,21 @@ BASE = "https://opendart.fss.or.kr/api/"
 MAX_BYTES = 64 * 1024 * 1024
 
 
+def validate_request(endpoint, params):
+    # Only relative OpenDART read endpoints; callers cannot supply another host,
+    # URL query, path, or credential. The local key is attached by the transport.
+    if not isinstance(endpoint, str) or not (
+            re.fullmatch(r"[A-Za-z][A-Za-z0-9]*\.json", endpoint)
+            or endpoint in {"corpCode.xml", "document.xml", "fnlttXbrl.xml"}):
+        raise DartError("unsupported_endpoint")
+    if not isinstance(params, dict) or any(
+            not isinstance(k, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", k)
+            or any(word in k for word in ("key", "token", "secret", "password"))
+            or isinstance(v, bool) or not isinstance(v, (str, int))
+            for k, v in params.items()):
+        raise DartError("invalid_parameters")
+
+
 class DartError(Exception):
     def __init__(self, code):
         self.code = str(code)
@@ -50,11 +65,9 @@ class DartClient:
         self.before_request = lambda: None
 
     def get(self, endpoint, params):
+        validate_request(endpoint, params)
         if not self.api_key:
             raise DartError("missing_key")
-        if endpoint not in {"corpCode.xml", "company.json", "list.json",
-                            "document.xml", "fnlttSinglAcntAll.json"}:
-            raise DartError("unsupported_endpoint")
         query = urlencode({**params, "crtfc_key": self.api_key})
         for attempt in range(3):
             self.before_request()

@@ -39,7 +39,7 @@ class Text(HTMLParser):
 def document_text(raw):
     result = []
     for name, body in sorted(unpack(raw), key=lambda member: member[0]):
-        if not name.lower().endswith((".xml", ".html", ".htm")):
+        if not name.lower().endswith((".xml", ".html", ".htm", ".xbrl", ".xsd")):
             continue
         decoded = None
         for encoding in ("utf-8-sig", "cp949"):

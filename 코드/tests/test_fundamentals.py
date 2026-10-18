@@ -19,6 +19,7 @@ from urllib.error import URLError
 import zipfile
 
 from money.cli import load_env
+from money.cli import main as cli_main
 from money.common import clean
 from money.dart_client import DartClient, DartError, unpack, xml_root
 from money.dart_data import metrics
@@ -246,16 +247,124 @@ class FundamentalsTests(unittest.TestCase):
         self.clock.value += timedelta(hours=1)
         self.sync()
 
-    def test_request_budget_resumes_classes_and_pending_work_after_restart(self):
-        self.cache.config["max_requests_per_run"] = 2
-        self.assertEqual(self.cache.sync()["last_error"], "run_budget")
-        self.assertEqual(self.cache._meta("index_window")["done"], ["Y"])
-        self.cache = Fundamentals(self.path, {**self.config, "max_requests_per_run": 2}, self.client, self.clock)
-        self.client.calls.clear()
-        self.cache.sync()
-        self.assertEqual([p["corp_cls"] for e, p in self.client.calls if e == "list.json"], ["K", "N"])
-        self.cache.config["max_requests_per_run"] = 1000
-        self.sync()
+    def test_legacy_local_run_and_daily_limits_do_not_stop_requests(self):
+        self.cache = Fundamentals(self.path, {**self.config, "max_requests_per_run": 1,
+            "max_requests_per_day": 1}, self.client, self.clock)
+        with self.cache.db() as db:
+            db.execute("INSERT INTO usage VALUES ('20261016',40000)")
+        for _ in range(1001):
+            self.client.get("company.json", {"corp_code": "00126380"})
+        self.assertEqual(self.cache.requests, 1001)
+        with self.cache.db() as db:
+            self.assertEqual(db.execute("SELECT requests FROM usage").fetchone()[0], 41001)
+        self.assertEqual(self.cache.status()["local_request_limits"], {"per_run": None, "per_day": None})
+
+    def test_no_startup_or_periodic_open_dart_collection(self):
+        root = Path(self.tmp.name)
+        subprocess.run([sys.executable, "-m", "money.cli", "init", "--root", str(root)],
+                       capture_output=True, text=True, check=True)
+        with patch("sys.argv", ["money", "run", "--root", str(root)]), \
+                patch("money.cli.Fundamentals", return_value=self.cache), \
+                patch("money.cli.make_server"), patch("money.cli.signal.signal"), \
+                patch("money.cli.Engine") as engine:
+            engine.return_value.tick.side_effect = KeyboardInterrupt
+            with self.assertRaises(KeyboardInterrupt):
+                cli_main()
+            engine.return_value.tick.assert_called_once()
+        self.assertEqual(self.client.calls, [])
+        self.assertFalse(self.cache.status()["automatic_collection"])
+        self.assertEqual(self.client.calls, [])
+
+    def test_old_budget_pause_is_archived_and_never_blocks_new_api_requests(self):
+        old = {"status": "paused", "error": "run_budget", "requests": 1000}
+        self.cache._set_meta("run", old)
+        resumed = Fundamentals(self.path, self.config, self.client, self.clock)
+        self.assertEqual(resumed.status()["status"], "idle")
+        self.assertEqual(resumed._meta("legacy_budget_pause"), old)
+        self.assertEqual(resumed.call_api("company.json", {"corp_code": "00126380"})["api_status"], "000")
+
+    def test_direct_api_only_fetches_requested_source_and_reuses_unchanged_data(self):
+        params = {"corp_code": "00126380"}
+        out = self.cache.call_api("company.json", params)
+        self.assertFalse(out["cache_hit"])
+        self.assertNotIn("data", out)
+        self.assertEqual(self.client.calls, [("company.json", params)])
+        seq = self.cache.status()["latest_change_seq"]
+        again = self.cache.call_api("company.json", params, include_data=True)
+        self.assertTrue(again["cache_hit"])
+        self.assertEqual(again["data"]["acc_mt"], "12")
+        self.assertEqual(len(self.client.calls), 1)
+        self.cache.call_api("company.json", params, refresh=True)
+        self.assertEqual(len(self.client.calls), 2)
+        self.assertEqual(self.cache.status()["latest_change_seq"], seq)
+        self.assertEqual(self.cache.status()["pending_sources"], 0)
+        self.assertEqual(self.cache.status()["companies"], 0)
+        self.assertIn("acc_mt", self.cache.evidence(out["source_key"])["untrusted_source_text"])
+
+    def test_direct_api_different_parameters_and_corrections_preserve_versions(self):
+        first = self.cache.call_api("company.json", {"corp_code": "00126380"})
+        second = self.cache.call_api("company.json", {"corp_code": "00164779"})
+        self.assertNotEqual(first["source_key"], second["source_key"])
+        original = self.client.get
+        def revised(endpoint, params):
+            payload = original(endpoint, params)
+            payload["acc_mt"] = "03"
+            return payload
+        self.client.get = revised
+        self.cache.call_api("company.json", {"corp_code": "00126380"}, refresh=True)
+        with self.cache.db() as db:
+            versions = db.execute("SELECT COUNT(*) FROM versions").fetchone()[0]
+            provenance = db.execute("SELECT value FROM meta WHERE key=?", ("request:" + first["source_key"],)).fetchone()[0]
+        self.assertEqual(versions, 3)
+        self.assertNotIn("a" * 40, provenance)
+        self.assertIn("03", self.cache.evidence(first["source_key"])["untrusted_source_text"])
+
+    def test_direct_api_preserves_provider_pagination_and_never_queues_documents(self):
+        params = {"bgn_de": "20261015", "end_de": "20261016", "corp_cls": "Y", "page_no": 1, "page_count": 1}
+        out = self.cache.call_api("list.json", params, include_data=True)
+        self.assertEqual(len(self.client.calls), 1)
+        self.assertEqual(out["returned_rows"], 1)
+        self.assertEqual(out["provider_pagination"]["total_page"], 1)
+        with self.cache.db() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 0)
+
+    def test_direct_financial_row_order_is_not_a_data_change(self):
+        params = {"corp_code": "00126380", "bsns_year": "2025", "reprt_code": "11011", "fs_div": "CFS"}
+        self.cache.call_api("fnlttSinglAcntAll.json", params)
+        seq = self.cache.status()["latest_change_seq"]
+        original = self.client.get
+        def reordered(endpoint, params):
+            payload = original(endpoint, params)
+            payload["list"].reverse()
+            payload["message"] = "Changed transport message"
+            return payload
+        self.client.get = reordered
+        self.cache.call_api("fnlttSinglAcntAll.json", params, refresh=True)
+        self.assertEqual(self.cache.status()["latest_change_seq"], seq)
+
+    def test_direct_xbrl_zip_is_stored_and_evidence_can_be_read(self):
+        self.client.get = lambda endpoint, params: archive("<xbrl><value>123</value></xbrl>", "report.xbrl")
+        out = self.cache.call_api("fnlttXbrl.xml", {"rcept_no": "20261015000001", "reprt_code": "11011"})
+        self.assertEqual(out["media"], "zip")
+        self.assertIn("123", self.cache.evidence(out["source_key"])["untrusted_source_text"])
+
+    def test_direct_api_records_no_data_and_keeps_provider_quota_error(self):
+        out = self.cache.call_api("fnlttSinglAcntAll.json", {"corp_code": "00164779", "bsns_year": "2025", "reprt_code": "11011"})
+        self.assertEqual(out["availability"], "no_data")
+        self.client.fail["company.json"] = "020"
+        with self.assertRaises(DartError) as caught:
+            self.cache.call_api("company.json", {"corp_code": "00126380"})
+        self.assertEqual(caught.exception.code, "020")
+        self.assertEqual(self.cache.status()["last_error"], "020")
+
+    def test_direct_api_rejects_urls_and_credentials_without_transport_or_storage(self):
+        for endpoint, params in [("https://evil.test/company.json", {}), ("../company.json", {}),
+                ("company.json?crtfc_key=x", {}), ("company.json", {"crtfc_key": "secret"}),
+                ("company.json", {"corp_code": ["00126380"]})]:
+            with self.subTest(endpoint=endpoint), self.assertRaises(DartError):
+                self.cache.call_api(endpoint, params)
+        self.assertEqual(self.client.calls, [])
+        self.assertEqual(self.cache.status()["cached_sources"], 0)
 
     def test_transient_failure_never_becomes_no_data_or_completed_baseline(self):
         self.client.fail["fnlttSinglAcntAll.json"] = "network_error"
@@ -315,10 +424,7 @@ class FundamentalsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.cache.export(target)
 
-    def test_durable_daily_quota_and_missing_key_are_explicit(self):
-        self.cache.config["max_requests_per_day"] = 1
-        self.assertEqual(self.cache.sync()["last_error"], "020")
-        self.assertEqual(self.cache.sync()["last_error"], "020")
+    def test_missing_key_is_explicit(self):
         missing = Fundamentals(Path(self.tmp.name) / "missing.sqlite", self.config,
                                DartClient(""), self.clock)
         self.assertEqual(missing.sync()["last_error"], "missing_key")
@@ -341,6 +447,18 @@ class FundamentalsTests(unittest.TestCase):
 
 
 class DartTransportTests(unittest.TestCase):
+    def test_other_json_read_endpoints_use_only_official_host_and_local_key(self):
+        from urllib.parse import parse_qs, urlsplit
+        requested = []
+        def opener(url, timeout):
+            requested.append(url)
+            return io.BytesIO(b'{"status":"000","list":[]}')
+        client = DartClient("b" * 40, interval=0, opener=opener, sleep=lambda _: None)
+        client.get("alotMatter.json", {"corp_code": "00126380", "bsns_year": "2025", "reprt_code": "11011"})
+        url = urlsplit(requested[0])
+        self.assertEqual((url.scheme, url.netloc, url.path), ("https", "opendart.fss.or.kr", "/api/alotMatter.json"))
+        self.assertEqual(parse_qs(url.query)["crtfc_key"], ["b" * 40])
+
     def test_transport_does_not_leak_key_from_network_exception(self):
         key = "b" * 40
         def fail(url, timeout):

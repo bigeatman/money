@@ -14,28 +14,30 @@ from pathlib import Path
 import re
 import sqlite3
 import threading
-import time
 from zoneinfo import ZoneInfo
 import zlib
 
 from .common import now
-from .dart_client import BASE, DartClient, DartError
+from .dart_client import BASE, DartClient, DartError, validate_request
 from .dart_data import changes, document_text, dumps, metrics
 
-VERSION = "opendart-v1"
+VERSION = "opendart-v2"
 SCHEMA = 1
 DEFAULTS = {"enabled": True, "history_years": 3, "disclosure_days": 365,
     "overlap_days": 2, "interval_seconds": 3600, "master_refresh_seconds": 86400,
-    "request_interval_seconds": 0.3, "max_requests_per_run": 1000,
-    "max_requests_per_day": 18000}
+    "request_interval_seconds": 0.3}
 REPORTS = ("11011", "11013", "11012", "11014")
-STOP_CODES = {"missing_key", "010", "011", "012", "020", "901", "run_budget", "stopping"}
+STOP_CODES = {"missing_key", "010", "011", "012", "020", "901", "stopping"}
 
 
 class Fundamentals:
     def __init__(self, path, config=None, client=None, clock=now):
         self.path, self.clock = Path(path), clock
         self.config = {**DEFAULTS, **(config or {})}
+        # Legacy installations keep their config files. Old local quotas have
+        # no effect, even when those files still explicitly contain 1000/18000.
+        for name in ("max_requests_per_run", "max_requests_per_day"):
+            self.config.pop(name, None)
         if not isinstance(self.config["enabled"], bool):
             raise ValueError("opendart.enabled must be boolean")
         for name in DEFAULTS.keys() - {"enabled", "request_interval_seconds"}:
@@ -48,12 +50,11 @@ class Fundamentals:
         if isinstance(interval, bool) or not isinstance(interval, (int, float)) or not 0 <= interval <= 30:
             raise ValueError("invalid OpenDART request interval")
         self.client = client or DartClient(os.environ.get("OPENDART_API_KEY", ""), interval)
-        self.client.before_request = self._request_budget
+        self.client.before_request = self._record_request
         self.lock, self.stop = threading.RLock(), threading.Event()
         self.thread = None
         self.running = False
         self.requests = 0
-        self.next_run = 0.0
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.db() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
@@ -82,6 +83,10 @@ class Fundamentals:
                 PRAGMA user_version=1;
             """)
         self.path.chmod(0o600)
+        previous = self._meta("run", {})
+        if previous.get("error") == "run_budget":
+            self._set_meta("legacy_budget_pause", previous)
+            self._set_meta("run", {"status": "idle", "reason": "local_request_limits_removed"})
 
     @contextmanager
     def db(self):
@@ -102,19 +107,73 @@ class Fundamentals:
         with self.db() as db:
             db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, dumps(value)))
 
-    def _request_budget(self):
+    def _record_request(self):
         if self.stop.is_set():
             raise DartError("stopping")
-        if self.requests >= self.config["max_requests_per_run"]:
-            raise DartError("run_budget")
         day = self.clock().astimezone(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
         with self.db() as db:
             db.execute("INSERT OR IGNORE INTO usage VALUES (?,0)", (day,))
-            count = db.execute("SELECT requests FROM usage WHERE day=?", (day,)).fetchone()[0]
-            if count >= self.config["max_requests_per_day"]:
-                raise DartError("020")
             db.execute("UPDATE usage SET requests=requests+1 WHERE day=?", (day,))
         self.requests += 1
+
+    def call_api(self, endpoint, params=None, refresh=False, include_data=False):
+        """Execute only the specified API request, or reuse its exact cache entry.
+
+        No master crawl, extra report types, pagination, documents, or follow-up
+        jobs are started implicitly. API response status/quotas remain intact.
+        """
+        params = {} if params is None else params
+        validate_request(endpoint, params)
+        if not isinstance(refresh, bool) or not isinstance(include_data, bool):
+            raise ValueError("refresh and include_data must be boolean")
+        key = "api:" + endpoint + ":" + hashlib.sha256(dumps(params).encode()).hexdigest()
+        with self.lock, self.path.with_suffix(self.path.suffix + ".lock").open("a+") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ValueError("another OpenDART request is running; retry when it finishes") from None
+            with self.db() as db:
+                stored, payload = self._stored(db, key)
+            hit = stored is not None and not refresh
+            if not hit:
+                self.requests = 0
+                self._set_meta("run", {"status": "running", "mode": "on_demand", "endpoint": endpoint,
+                                       "started_at": self.clock().isoformat()})
+                try:
+                    payload = self.client.get(endpoint, params)
+                    availability = "no_data" if isinstance(payload, dict) and payload.get("status") == "013" else "available"
+                    corp = params.get("corp_code", "")
+                    with self.db() as db:
+                        self._save(db, key, corp, payload, availability)
+                    self._set_meta("request:" + key, {"endpoint": endpoint, "parameters": params,
+                                                     "checked_at": self.clock().isoformat()})
+                except Exception as exc:
+                    code = exc.code if isinstance(exc, DartError) else "request_error"
+                    self._set_meta("run", {"status": "paused" if code in STOP_CODES else "failed",
+                        "mode": "on_demand", "error": code, "requests": self.requests,
+                        "finished_at": self.clock().isoformat()})
+                    raise DartError(code) from None
+                self._set_meta("run", {"status": "complete", "mode": "on_demand", "endpoint": endpoint,
+                    "requests": self.requests, "finished_at": self.clock().isoformat()})
+            with self.db() as db:
+                stored, payload = self._stored(db, key)
+            provenance = self._meta("request:" + key, {})
+            result = {"read_only": True, "endpoint": endpoint, "parameters": params, "cache_hit": hit,
+                "source_key": key, "collected_at": stored["collected"], "checked_at": provenance.get("checked_at"),
+                "availability": stored["availability"], "media": stored["media"],
+                "stored_bytes": len(stored["body"]), "source_url": BASE + endpoint}
+            if isinstance(payload, dict):
+                result["api_status"] = payload.get("status")
+                if isinstance(payload.get("list"), list):
+                    result["returned_rows"] = len(payload["list"])
+                result["provider_pagination"] = {k: payload[k] for k in
+                    ("page_no", "page_count", "total_count", "total_page") if k in payload}
+                if include_data:
+                    result["data"] = payload
+            else:
+                result["original_bytes"] = len(payload)
+                result["evidence_tool"] = "get_fundamental_evidence"
+            return result
 
     def _queue(self, db, key, corp, endpoint, params, invalidate=False):
         row = db.execute("SELECT key FROM tasks WHERE key=?", (key,)).fetchone()
@@ -146,7 +205,7 @@ class Fundamentals:
         raw = payload if binary else dumps(payload).encode()
         # ZIP timestamps and entry ordering are transport details, not new evidence.
         canonical = document_text(payload).encode() if binary else raw
-        if key.startswith("financial:") and isinstance(payload, dict):
+        if key.startswith(("financial:", "api:fnlttSinglAcntAll.json:")) and isinstance(payload, dict):
             normalized = {k: v for k, v in payload.items() if k != "message"}
             if isinstance(normalized.get("list"), list):
                 normalized["list"] = sorted(normalized["list"], key=dumps)
@@ -384,15 +443,6 @@ class Fundamentals:
             self.thread.start()
         return self.status()
 
-    def heartbeat(self):
-        if not self.config["enabled"] or not self.client.api_key or self.stop.is_set():
-            return
-        with self.lock:
-            if self.running or time.monotonic() < self.next_run:
-                return
-            self.next_run = time.monotonic() + self.config["interval_seconds"]
-        self.start()
-
     def close(self):
         self.stop.set()
         if self.thread:
@@ -414,14 +464,16 @@ class Fundamentals:
                 except BlockingIOError:
                     pass
         return {"version": VERSION, "schema_version": SCHEMA, "read_only": True,
+            "collection_mode": "on_demand", "automatic_collection": False,
+            "local_request_limits": {"per_run": None, "per_day": None},
             "configured": bool(self.client.api_key), "enabled": self.config["enabled"],
             "status": "running" if self.running else "interrupted" if stale_run else run["status"],
             "run": run, "companies": companies, "cached_sources": sources,
             "pending_sources": self._pending(), "unavailable_sources": unavailable,
             "latest_change_seq": seq, "indexed_through": self._meta("indexed_through"),
-            "coverage": {"universe": "listed issuers in OpenDART corpCode master; not all KRX securities",
-                "financial_years": self.config["history_years"], "bases": ["CFS", "OFS"],
-                "report_codes": list(REPORTS), "disclosure_days": self.config["disclosure_days"],
+            "coverage": {"universe": "explicitly requested API responses; previous issuer cache preserved",
+                "financial_years": None, "bases": None,
+                "report_codes": None, "disclosure_days": None,
                 "sources": ["OpenDART"], "market_prices": False, "investment_review_complete": False},
             "last_error": run.get("error")}
 
@@ -538,6 +590,9 @@ class UnavailableFundamentals:
 
     def start(self):
         raise ValueError("OpenDART configuration/cache unavailable; preserve the database and check locally")
+
+    def call_api(self, *args, **kwargs):
+        raise ValueError("OpenDART configuration/cache unavailable; check locally")
 
     def evidence(self, *args, **kwargs):
         self.start()

@@ -727,10 +727,10 @@ class Engine:
             "us_prior_unresolved_orders": "blocked until explicit broker reconciliation; today-only API"}
         return caps
 
-    def start_fundamental_sync(self):
+    def call_dart_api(self, endpoint, params=None, refresh=False, include_data=False):
         if self.fundamentals is None:
-            raise ValueError("OpenDART collector is not configured")
-        return self.fundamentals.start()
+            raise ValueError("OpenDART is not configured")
+        return self.fundamentals.call_api(endpoint, params, refresh, include_data)
 
     def fundamental_report(self, symbol=None, after_seq=None, offset=0, limit=20, through_seq=None):
         if self.fundamentals is None:

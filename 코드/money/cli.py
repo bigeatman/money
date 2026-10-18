@@ -34,7 +34,7 @@ def load_env(path):
 def main():
     p = argparse.ArgumentParser(description="Work analysis → Termux Kiwoom DEMO execution")
     p.add_argument("command", choices=["init", "credentials", "run", "import-plan", "status", "mcp-url",
-        "dart-credentials", "dart-sync", "dart-status", "dart-show", "dart-export"])
+        "dart-credentials", "dart-status", "dart-show", "dart-export", "dart-api"])
     p.add_argument("--root", default=".")
     p.add_argument("--market", choices=["KR", "US"])
     p.add_argument("--file")
@@ -43,6 +43,10 @@ def main():
     p.add_argument("--through-seq", type=int)
     p.add_argument("--offset", type=int, default=0)
     p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--endpoint")
+    p.add_argument("--params", default="{}", help="JSON OpenDART parameters; key is read locally")
+    p.add_argument("--refresh", action="store_true")
+    p.add_argument("--include-data", action="store_true")
     p.add_argument("--public-origin", help="HTTPS tunnel origin, e.g. https://your-private-host.example")
     args = p.parse_args()
     root = Path(args.root).resolve()
@@ -104,8 +108,10 @@ def main():
     config = json.loads(configfile.read_text())
     if args.command.startswith("dart-"):
         dart = Fundamentals(root / "runtime" / "fundamentals.sqlite", config.get("opendart"))
-        if args.command == "dart-sync":
-            result = dart.sync()
+        if args.command == "dart-api":
+            if not args.endpoint:
+                raise SystemExit("--endpoint ENDPOINT is required")
+            result = dart.call_api(args.endpoint, json.loads(args.params), args.refresh, args.include_data)
         elif args.command == "dart-status":
             result = dart.status()
         elif args.command == "dart-export":
@@ -115,8 +121,6 @@ def main():
         else:
             result = dart.report(args.symbol, args.after_seq, args.offset, args.limit, args.through_seq)
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        if args.command == "dart-sync" and result["status"] in {"failed", "paused"}:
-            raise SystemExit(1)
         return
     if config["broker"] not in {"paper", "kiwoom-demo"}:
         raise SystemExit("Only offline paper or Kiwoom DEMO is supported")
@@ -162,10 +166,6 @@ def main():
         while not stop.is_set():
             if scanner is not None:
                 scanner.heartbeat()
-            try:
-                dart.heartbeat()
-            except (OSError, ValueError, sqlite3.Error):
-                pass  # Read-only issuer research never interrupts order management.
             engine.tick()
             stop.wait(max(1, float(config["poll_seconds"])))
     finally:
@@ -173,9 +173,11 @@ def main():
         if scanner is not None:
             scanner.close()
         server.shutdown()
+        server.server_close()
         with engine.lock:
             store.save()
         store.close()
+        lockfile.close()
 
 
 if __name__ == "__main__":

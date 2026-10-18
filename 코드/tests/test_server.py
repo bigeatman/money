@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 from money.common import clean
 from money.engine import Engine
+from money.dart_client import DartClient
+from money.fundamentals import Fundamentals
 from money.paper import PaperBroker
 from money.server import make_server
 from money.store import Store
@@ -46,7 +48,7 @@ class ServerTests(unittest.TestCase):
         self.assertEqual({t["name"] for t in data["result"]["tools"]},
                          {"get_trading_snapshot", "submit_trading_plan", "get_execution_status",
                           "start_market_scan", "get_market_scan", "get_market_context",
-                          "start_fundamental_sync", "get_fundamentals", "get_fundamental_evidence"})
+                          "call_dart_api", "get_fundamentals", "get_fundamental_evidence"})
         _, data = self.rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                            "params": {"name": "get_execution_status", "arguments": {}}})
         self.assertFalse(data["result"]["isError"])
@@ -108,7 +110,8 @@ class ServerTests(unittest.TestCase):
 
     def test_fundamental_tools_are_read_only_and_route_paged_cache_queries(self):
         cases = [
-            ("start_fundamental_sync", {}, "start_fundamental_sync", ()),
+            ("call_dart_api", {"endpoint": "company.json", "params": {"corp_code": "00126380"}, "refresh": True},
+             "call_dart_api", ("company.json", {"corp_code": "00126380"}, True, False)),
             ("get_fundamentals", {"symbol": "005930", "after_seq": 4, "through_seq": 9, "limit": 2},
              "fundamental_report", ("005930", 4, 0, 2, 9)),
             ("get_fundamental_evidence", {"source_key": "change:9", "offset": 8, "limit": 90},
@@ -121,6 +124,27 @@ class ServerTests(unittest.TestCase):
                 read.assert_called_once_with(*expected)
         self.assertFalse(self.store.state["orders"])
         self.assertFalse(self.store.state["plans"])
+
+    def test_direct_dart_bridge_persists_only_requested_response(self):
+        client = DartClient("b" * 40, interval=0)
+        cache = Fundamentals(Path(self.tmp.name) / "research.sqlite", client=client)
+        self.engine.fundamentals = cache
+        try:
+            payload = {"status": "000", "corp_code": "00126380", "acc_mt": "12"}
+            with patch.object(client, "get", return_value=payload) as api:
+                request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+                    "name": "call_dart_api", "arguments": {"endpoint": "company.json",
+                    "params": {"corp_code": "00126380"}, "include_data": True}}}
+                _, first = self.rpc(request)
+                self.assertFalse(first["result"]["isError"])
+                self.assertEqual(first["result"]["structuredContent"]["data"], payload)
+                _, second = self.rpc(request)
+                self.assertTrue(second["result"]["structuredContent"]["cache_hit"])
+                api.assert_called_once_with("company.json", {"corp_code": "00126380"})
+            self.assertEqual(cache.status()["pending_sources"], 0)
+            self.assertFalse(self.store.state["orders"])
+        finally:
+            cache.close()
 
 
 if __name__ == "__main__":

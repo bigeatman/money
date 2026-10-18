@@ -34,8 +34,11 @@ PLAN = {"type": "object", "properties": {
 
 def tools():
     return [
-        {"name": "start_fundamental_sync", "description": "Start or reuse asynchronous read-only OpenDART issuer/disclosure/financial cache synchronization. Resume durable pending work; no trades or AI calls. API key must be configured locally. Collection covers OpenDART only, not all investment criteria.",
-         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+        {"name": "call_dart_api", "description": "Execute a specific read-only OpenDART API request with locally stored credentials and persist its full response/diff. Supply an endpoint filename and exact parameters. No automatic follow-up requests, universe crawl or local per-run/daily quotas. By default reuse the exact cached request; refresh=true explicitly fetches again. Default response is storage/provenance/counts; include_data=true returns the full JSON response. Read stored originals with get_fundamental_evidence. Binary endpoints: corpCode.xml, document.xml, fnlttXbrl.xml; other read APIs use .json. Provider errors and pagination are returned without automatic expansion.",
+         "inputSchema": {"type": "object", "properties": {"endpoint": {"type": "string"},
+             "params": {"type": "object", "additionalProperties": {"type": ["string", "integer"]}},
+             "refresh": {"type": "boolean"}, "include_data": {"type": "boolean"}},
+             "required": ["endpoint"], "additionalProperties": False},
          "annotations": {"readOnlyHint": True, "openWorldHint": True, "idempotentHint": True}},
         {"name": "get_fundamentals", "description": "Read cached OpenDART inputs without network calls. Default: page listed issuers. symbol: page that issuer's CFS/OFS financial summaries. after_seq: page durable changes through a fixed through_seq; save completed_through_seq only after all pages/evidence are reviewed. Follow next_offset/next_after_seq; missing/stale data is not zero or completed investment analysis.",
          "inputSchema": {"type": "object", "properties": {"symbol": {"type": "string"},
@@ -160,7 +163,7 @@ def make_server(engine, token, host="127.0.0.1", port=8765, allowed_origins=()):
                     requested = params.get("protocolVersion", "2025-06-18")
                     selected = requested if requested in {"2025-03-26", "2025-06-18"} else "2025-06-18"
                     result = {"protocolVersion": selected, "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "money-demo-executor", "version": "0.4.0"},
+                        "serverInfo": {"name": "money-demo-executor", "version": "0.5.0"},
                         "instructions": "Demo trading only. Read snapshot before decisions. Start/reuse a full-market scan and poll get_market_scan; follow every next_offset for candidates and waiting/event-review rows. Collection completeness is not completed AI investment review. Incomplete/missing data is unfinished selection, never no opportunities: defer new BUY while continuing all holding/SELL/REPRICE management. New BUY requires fresh complete full-market inputs and a separate investment decision. Keep shared KR+US KRW 1,000,000 including fees. KRX opening-auction BUY supports preopen=true with LIMIT or MARKET; MARKET buy_limit must cover the fetched daily upper_limit. Unsent auction buys expire at regular open. Regular buys require live bid/ask. Never invent prices/probabilities/RVOL. No forced liquidation at close or date rollover. Check actual status after submitting."}
                 elif method == "ping":
                     result = {}
@@ -171,8 +174,9 @@ def make_server(engine, token, host="127.0.0.1", port=8765, allowed_origins=()):
                     try:
                         if name == "get_trading_snapshot":
                             result_data = engine.snapshot(args["market"], args.get("instruments"), args.get("include_charts", True))
-                        elif name == "start_fundamental_sync":
-                            result_data = engine.start_fundamental_sync()
+                        elif name == "call_dart_api":
+                            result_data = engine.call_dart_api(args["endpoint"], args.get("params"),
+                                args.get("refresh", False), args.get("include_data", False))
                         elif name == "get_fundamentals":
                             result_data = engine.fundamental_report(args.get("symbol"), args.get("after_seq"),
                                 args.get("offset", 0), args.get("limit", 20), args.get("through_seq"))
