@@ -1,4 +1,5 @@
 import json
+import io
 from pathlib import Path
 import tempfile
 import threading
@@ -48,7 +49,8 @@ class ServerTests(unittest.TestCase):
         self.assertEqual({t["name"] for t in data["result"]["tools"]},
                          {"get_trading_snapshot", "submit_trading_plan", "get_execution_status",
                           "start_market_scan", "get_market_scan", "get_market_context",
-                          "call_dart_api", "query_dart_data", "get_fundamentals", "get_fundamental_evidence"})
+                          "call_dart_api", "query_dart_data", "get_fundamentals", "get_fundamental_evidence",
+                          "manage_dart_collection", "record_dart_review"})
         _, data = self.rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                            "params": {"name": "get_execution_status", "arguments": {}}})
         self.assertFalse(data["result"]["isError"])
@@ -57,6 +59,31 @@ class ServerTests(unittest.TestCase):
     def test_notifications_are_accepted_without_body(self):
         code, body = self.rpc({"jsonrpc": "2.0", "method": "notifications/initialized"})
         self.assertEqual((code, body), (202, None))
+
+    def test_explicit_dart_job_and_attributed_review_round_trip_through_mcp(self):
+        client = DartClient("b" * 40, interval=0, opener=lambda *a, **k: io.BytesIO(b'{"status":"000","corp_code":"00126380"}'))
+        f = Fundamentals(Path(self.tmp.name) / "fundamentals.sqlite", client=client)
+        self.engine.fundamentals = f
+        def call(name, args):
+            _, out = self.rpc({"jsonrpc": "2.0", "id": 71, "method": "tools/call", "params": {"name": name, "arguments": args}})
+            self.assertFalse(out["result"].get("isError"), out)
+            return out["result"]["structuredContent"]
+        plan = {"companies": [{"symbol": "005930", "corp_code": "00126380"}],
+                "requests": [{"symbol": "005930", "corp_code": "00126380", "endpoint": "company.json", "params": {"corp_code": "00126380"}}],
+                "catalog": [{"id": "common_01", "title": "기업 구조"}]}
+        try:
+            out = call("manage_dart_collection", {"action": "start", "job_id": "mcp_fixture", "plan": plan})
+            f.jobs.thread.join(5)
+            out = call("manage_dart_collection", {"action": "status", "job_id": out["job_id"]})
+            self.assertTrue(out["collection_complete"])
+            source = out["rows"][0]["source_key"]
+            saved = call("record_dart_review", {"job_id": out["job_id"], "symbol": "005930", "items": [
+                {"item_id": "common_01", "status": "partial", "reason": "법인번호는 확인, 그룹 구조 원문 추가 검토 필요", "facts": {"corp_code": "00126380"}, "source_keys": [source]}]})
+            self.assertEqual(saved["stored"], 1)
+            reviews = call("manage_dart_collection", {"action": "status", "job_id": out["job_id"], "view": "reviews"})
+            self.assertEqual(reviews["rows"][0]["body"]["provenance"], "assistant_review")
+        finally:
+            f.close()
 
     def test_unauthorized_and_untrusted_origin_denied(self):
         for path, headers, expected in [("/mcp", {}, 401),

@@ -22,8 +22,9 @@ from .common import now
 from .dart_client import BASE, DartClient, DartError, validate_request, xml_root
 from .dart_data import changes, document_text, dumps, metrics
 from .dart_archive import DartArchive, content_hash, media_type
+from .dart_jobs import DartJobs
 
-VERSION = "opendart-v3"
+VERSION = "opendart-v4"
 SCHEMA = 2
 DEFAULTS = {"enabled": True, "history_years": 3, "disclosure_days": 365,
     "overlap_days": 2, "interval_seconds": 3600, "master_refresh_seconds": 86400,
@@ -84,6 +85,7 @@ class Fundamentals:
                 CREATE TABLE IF NOT EXISTS usage (day TEXT PRIMARY KEY, requests INTEGER NOT NULL);
             """)
         self.archive = DartArchive(self.path.with_suffix(".files"), self.db, self.clock)
+        self.jobs = DartJobs(self)
         self.client.archive = self.archive
         with self.db() as db:
             db.execute("PRAGMA user_version=2")
@@ -171,6 +173,7 @@ class Fundamentals:
                 "availability": stored["availability"], "media": stored["media"],
                 "stored_bytes": len(stored["body"]), "source_url": BASE + endpoint,
                 "archive": archive, "query_tool": "query_dart_data"}
+            result["network_requests"] = 0 if hit else self.requests
             if isinstance(payload, dict):
                 result["api_status"] = payload.get("status")
                 if isinstance(payload.get("list"), list):
@@ -483,6 +486,7 @@ class Fundamentals:
 
     def close(self):
         self.stop.set()
+        self.jobs.close()
         if self.thread:
             self.thread.join(35)
 
@@ -515,6 +519,7 @@ class Fundamentals:
             "archive": {"files": archive_files, "request_attempts": archive_requests,
                 "legacy_versions_pending": unarchived, "checksum": "sha256",
                 "directory": str(self.archive.root), "capture_exact_http_bodies": True},
+            "explicit_collection_jobs": True, "review_records": True,
             "coverage": {"universe": "explicitly requested API responses; previous issuer cache preserved",
                 "financial_years": None, "bases": None,
                 "report_codes": None, "disclosure_days": None,
@@ -627,6 +632,30 @@ class Fundamentals:
         self._page(offset, limit)
         return self.archive.verify(offset, limit)
 
+    def reindex_archive(self, limit=100, after_sha=""):
+        self._page(0, limit)
+        if after_sha and not re.fullmatch(r"[0-9a-f]{64}", after_sha):
+            raise ValueError("invalid archive cursor")
+        with self.lock, self.path.with_suffix(self.path.suffix + ".lock").open("a+") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ValueError("another OpenDART request is running") from None
+            return self.archive.reindex(limit, after_sha)
+
+    def collection_job(self, action, job_id=None, plan=None, retry_failed=False,
+                       view="requests", symbol=None, offset=0, limit=20):
+        if not isinstance(retry_failed, bool):
+            raise ValueError("retry_failed must be boolean")
+        if action == "start":
+            return self.jobs.start(job_id, plan, retry_failed)
+        if action == "status":
+            return self.jobs.report(job_id, offset, limit, view, symbol)
+        raise ValueError("action must be start or status")
+
+    def record_review(self, job_id, symbol, items):
+        return self.jobs.record_reviews(job_id, symbol, items)
+
     def migrate_archive(self, limit=100):
         """Resumable local-only backfill; old JSON bytes cannot be recovered."""
         self._page(0, limit)
@@ -692,6 +721,12 @@ class UnavailableFundamentals:
         self.start()
 
     def query_data(self, *args, **kwargs):
+        self.start()
+
+    def collection_job(self, *args, **kwargs):
+        self.start()
+
+    def record_review(self, *args, **kwargs):
         self.start()
 
     def heartbeat(self):

@@ -12,8 +12,9 @@ from pathlib import Path
 import shutil
 import tempfile
 
-from .dart_client import DartError, MAX_BYTES, unpack, xml_root
+from .dart_client import DartError, MAX_BYTES, unpack
 from .dart_data import Text, dumps
+from .dart_xml import report_root
 
 
 def sha256(raw):
@@ -107,6 +108,8 @@ class DartArchive:
                     version_hash TEXT PRIMARY KEY, sha256 TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS archive_data_hashes (
                     key TEXT PRIMARY KEY, content_sha256 TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS archive_parse_notes (
+                    sha256 TEXT PRIMARY KEY, mode TEXT NOT NULL, details TEXT NOT NULL);
             """)
 
     @staticmethod
@@ -201,7 +204,10 @@ class DartArchive:
                 error = "nul_in_text"
             if media == "xml":
                 try:
-                    structured = xml_value(xml_root(raw))
+                    root, note = report_root(raw, text)
+                    structured = xml_value(root)
+                    db.execute("INSERT OR REPLACE INTO archive_parse_notes VALUES (?,?,?)",
+                               (checksum, note["mode"], dumps(note)))
                 except (DartError, RecursionError) as exc:
                     # HTML, DTD-bearing documents and unparseable XML retain
                     # their complete decoded markup for search/evidence.
@@ -230,6 +236,34 @@ class DartArchive:
             self._register(db, self._write(io.BytesIO(raw)), provenance)
         self._index(db, checksum, raw)
         return checksum
+
+    def reindex(self, limit=100, after_sha=""):
+        """Retry failed XML indexes locally; the cursor also advances past failures."""
+        with self.connect() as db:
+            rows = db.execute("""SELECT f.* FROM archive_files f JOIN archive_content c USING(sha256)
+                WHERE f.media='xml' AND c.index_error IS NOT NULL AND f.sha256>?
+                ORDER BY f.sha256 LIMIT ?""", (after_sha, limit + 1)).fetchall()
+            results = []
+            for row in rows[:limit]:
+                if row["size"] > MAX_BYTES:
+                    results.append({"sha256": row["sha256"], "status": "response_size"})
+                    continue
+                path = self.root / row["path"]
+                try:
+                    raw = path.read_bytes()
+                    if sha256(raw) != row["sha256"]:
+                        raise ValueError("checksum_mismatch")
+                except (OSError, ValueError):
+                    results.append({"sha256": row["sha256"], "status": "file_unavailable"})
+                    continue
+                db.execute("DELETE FROM archive_fields WHERE sha256=?", (row["sha256"],))
+                db.execute("DELETE FROM archive_content WHERE sha256=?", (row["sha256"],))
+                self._index(db, row["sha256"], raw)
+                error = db.execute("SELECT index_error FROM archive_content WHERE sha256=?", (row["sha256"],)).fetchone()[0]
+                results.append({"sha256": row["sha256"], "status": error or "ok"})
+        return {"rows": results, "processed": len(results), "network_requests": 0,
+                "next_after_sha": rows[limit - 1]["sha256"] if len(rows) > limit else None,
+                "all_ok": all(x["status"] == "ok" for x in results)}
 
     def receive(self, endpoint, params, response, http_status):
         """Transport hook: file and ledger commit before response validation."""
@@ -320,11 +354,32 @@ class DartArchive:
 
     def query(self, view="sources", source_key=None, corp_code=None, endpoint=None,
               field=None, text=None, offset=0, limit=20):
-        if view not in {"sources", "fields", "requests", "files"}:
-            raise ValueError("view must be sources, fields, requests or files")
+        if view not in {"sources", "fields", "requests", "files", "text"}:
+            raise ValueError("view must be sources, fields, requests, files or text")
         for value in (source_key, corp_code, endpoint, field, text):
             if value is not None and (not isinstance(value, str) or len(value) > 500):
                 raise ValueError("invalid archive filter")
+        if view == "text":
+            if not source_key or not text or field is not None or corp_code is not None or endpoint is not None:
+                raise ValueError("text search requires source_key and text only")
+            with self.connect() as db:
+                row = db.execute("""SELECT c.text FROM archive_content c WHERE c.sha256=COALESCE(
+                    (SELECT sha256 FROM archive_sources WHERE key=?),
+                    (SELECT r.sha256 FROM archive_heads h JOIN archive_requests r ON r.id=h.request_id WHERE h.source_key=?))""",
+                    (source_key, source_key)).fetchone()
+            if row is None:
+                raise ValueError("source not found")
+            body, hits, cursor = row[0], [], offset
+            while len(hits) < limit:
+                match = body.find(text, cursor)
+                if match < 0:
+                    break
+                start, end = max(0, match - 600), min(len(body), match + len(text) + 1800)
+                hits.append({"match_offset": match, "context_offset": start, "text": body[start:end]})
+                cursor = match + len(text)
+            return {"read_only": True, "view": "text", "source_key": source_key, "rows": hits,
+                    "total_characters": len(body), "next_offset": cursor if body.find(text, cursor) >= 0 else None,
+                    "untrusted_source_data": True}
         if field is not None and view != "fields":
             raise ValueError("field is only supported by the fields view")
         if view == "fields" and (corp_code is not None or endpoint is not None):
@@ -357,7 +412,7 @@ class DartArchive:
                     sql += " AND instr(v.value,?)>0"; args.append(text)
                 sql += " ORDER BY f.ordinal,v.path"
             elif view == "files":
-                sql = "SELECT f.*,c.index_error FROM archive_files f LEFT JOIN archive_content c USING(sha256) WHERE 1=1"
+                sql = "SELECT f.*,c.index_error,p.mode AS parse_mode FROM archive_files f LEFT JOIN archive_content c USING(sha256) LEFT JOIN archive_parse_notes p USING(sha256) WHERE 1=1"
                 if source_key:
                     sql += """ AND f.sha256 IN (WITH RECURSIVE root(sha256) AS (
                         SELECT sha256 FROM archive_sources WHERE key=? UNION

@@ -35,7 +35,7 @@ def main():
     p = argparse.ArgumentParser(description="Work analysis → Termux Kiwoom DEMO execution")
     p.add_argument("command", choices=["init", "credentials", "run", "import-plan", "status", "mcp-url",
         "dart-credentials", "dart-status", "dart-show", "dart-export", "dart-api",
-        "dart-query", "dart-verify", "dart-migrate"])
+        "dart-query", "dart-verify", "dart-migrate", "dart-reindex", "dart-job", "dart-reviews"])
     p.add_argument("--root", default=".")
     p.add_argument("--market", choices=["KR", "US"])
     p.add_argument("--file")
@@ -50,7 +50,9 @@ def main():
     p.add_argument("--include-data", action="store_true")
     p.add_argument("--source-key")
     p.add_argument("--corp-code")
-    p.add_argument("--view", choices=["sources", "fields", "requests", "files"], default="sources")
+    p.add_argument("--view", choices=["sources", "fields", "requests", "files", "text"], default="sources")
+    p.add_argument("--job-id")
+    p.add_argument("--after-sha", default="")
     p.add_argument("--field")
     p.add_argument("--text")
     p.add_argument("--all", action="store_true", help="dart-migrate: process all local legacy versions in batches")
@@ -126,6 +128,29 @@ def main():
                                      args.field, args.text, args.offset, args.limit)
         elif args.command == "dart-verify":
             result = dart.verify_archive(args.offset, args.limit)
+        elif args.command == "dart-reindex":
+            cursor = args.after_sha
+            processed, unresolved = 0, []
+            while True:
+                result = dart.reindex_archive(args.limit, cursor)
+                processed += result["processed"]
+                unresolved.extend(x for x in result["rows"] if x["status"] != "ok")
+                if not args.all or result["next_after_sha"] is None:
+                    result.update(total_processed=processed, unresolved=unresolved, all_ok=not unresolved)
+                    break
+                cursor = result["next_after_sha"]
+                print(json.dumps(result, ensure_ascii=False), flush=True)
+        elif args.command == "dart-job":
+            if args.file:
+                result = dart.collection_job("start", args.job_id, json.loads(Path(args.file).read_text()))
+                dart.jobs.thread.join()
+                result = dart.collection_job("status", result["job_id"], limit=args.limit)
+            else:
+                result = dart.collection_job("status", args.job_id, offset=args.offset, limit=args.limit)
+        elif args.command == "dart-reviews":
+            if not args.file or not args.symbol or not args.job_id:
+                raise SystemExit("--job-id, --symbol and --file are required")
+            result = dart.record_review(args.job_id, args.symbol, json.loads(Path(args.file).read_text()))
         elif args.command == "dart-migrate":
             while True:
                 result = dart.migrate_archive(args.limit)

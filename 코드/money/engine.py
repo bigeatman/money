@@ -748,6 +748,17 @@ class Engine:
             raise ValueError("OpenDART is not configured")
         return self.fundamentals.query_data(view, source_key, corp_code, endpoint, field, text, offset, limit)
 
+    def manage_dart_collection(self, action, job_id=None, plan=None, retry_failed=False,
+                               view="requests", symbol=None, offset=0, limit=20):
+        if self.fundamentals is None:
+            raise ValueError("OpenDART storage unavailable")
+        return self.fundamentals.collection_job(action, job_id, plan, retry_failed, view, symbol, offset, limit)
+
+    def record_dart_review(self, job_id, symbol, items):
+        if self.fundamentals is None:
+            raise ValueError("OpenDART storage unavailable")
+        return self.fundamentals.record_review(job_id, symbol, items)
+
     def diagnostic(self, part, date=None):
         """Independent read-only US queries for an operator; no plans or orders."""
         with self.lock:

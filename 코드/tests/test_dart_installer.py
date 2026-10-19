@@ -1,11 +1,13 @@
 """Check that the standalone updater verifies DART without starting collection."""
 import importlib.util
+import base64
 import json
 from pathlib import Path
 import sqlite3
 import subprocess
 import tempfile
 import unittest
+import zlib
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -19,8 +21,9 @@ class DartInstallerTests(unittest.TestCase):
         self.ns = {"__name__": "dart_installer_fixture"}
         exec(compile(builder.template(ROOT), "dart_installer_fixture.py", "exec"), self.ns)
         self.status = {"execution_capabilities": {"fundamentals": {
-            "supported": True, "version": "opendart-v3", "schema_version": 2,
+            "supported": True, "version": "opendart-v4", "schema_version": 2,
             "configured": True, "enabled": True,
+            "explicit_collection_jobs": True, "review_records": True,
             "archive": {"capture_exact_http_bodies": True, "legacy_versions_pending": 10}}}}
         self.ns["verify_existing_server"] = lambda port, token: self.status
         self.calls = []
@@ -37,7 +40,7 @@ class DartInstallerTests(unittest.TestCase):
 
     def test_rejects_old_runtime_disabled_capture_or_missing_key(self):
         dart = self.status["execution_capabilities"]["fundamentals"]
-        for key, wrong in (("version", "opendart-v2"), ("schema_version", 1),
+        for key, wrong in (("version", "opendart-v3"), ("schema_version", 1),
                            ("configured", False), ("supported", False), ("enabled", False)):
             with self.subTest(key=key):
                 correct = dart[key]
@@ -68,6 +71,20 @@ class DartInstallerTests(unittest.TestCase):
                  patch.object(self.ns["sys"], "argv", ["updater.py", "--check"]):
                 self.assertEqual(self.ns["main"](), 0)
             self.assertEqual(seen, [root])
+
+    def test_embedded_plan_checksum_is_checked_before_any_source_install(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text(
+                '{"broker":"kiwoom-demo","capital_krw":"1000000","host":"127.0.0.1"}')
+            raw = b'{"job_id":"fixture","requests":[]}'
+            self.ns["PLAN_DATA"] = base64.b64encode(zlib.compress(raw)).decode()
+            self.ns["PLAN_SHA256"] = "0" * 64
+            self.ns["prepare"] = lambda project: []
+            self.ns["install"] = lambda *args: self.fail("invalid plan must not install")
+            with patch.object(self.ns["sys"], "argv", ["updater.py", str(root), "--start-plan"]):
+                with self.assertRaisesRegex(RuntimeError, "체크섬"):
+                    self.ns["main"]()
 
     def test_unknown_source_cannot_be_overwritten_and_reapply_is_noop(self):
         with tempfile.TemporaryDirectory() as tmp:
