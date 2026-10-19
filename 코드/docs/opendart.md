@@ -68,6 +68,8 @@ API 한 번의 요청으로 다른 기업·연도·보고서·연결/별도·다
 
 ## Termux CLI와 기존 DB 이관
 
+기존 휴대폰의 v2 코드를 갱신하려면 [Termux 업데이트 절차](opendart-termux-update.md)를 먼저 실행합니다.
+
 기존 설치의 `~/money-work/money/코드`에서 실행합니다. 신규 설치에서만 `python -m money.cli init`을 먼저 실행합니다.
 
 ```bash
