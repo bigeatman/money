@@ -23,6 +23,7 @@ from .dart_client import BASE, DartClient, DartError, validate_request, xml_root
 from .dart_data import changes, document_text, dumps, metrics
 from .dart_archive import DartArchive, content_hash, media_type
 from .dart_jobs import DartJobs
+from .dart_folders import DartFolders
 
 VERSION = "opendart-v4"
 SCHEMA = 2
@@ -86,6 +87,7 @@ class Fundamentals:
             """)
         self.archive = DartArchive(self.path.with_suffix(".files"), self.db, self.clock)
         self.jobs = DartJobs(self)
+        self.stock_folders = DartFolders(self)
         self.client.archive = self.archive
         with self.db() as db:
             db.execute("PRAGMA user_version=2")
@@ -520,6 +522,7 @@ class Fundamentals:
                 "legacy_versions_pending": unarchived, "checksum": "sha256",
                 "directory": str(self.archive.root), "capture_exact_http_bodies": True},
             "explicit_collection_jobs": True, "review_records": True,
+            "stock_raw_folders": True,
             "coverage": {"universe": "explicitly requested API responses; previous issuer cache preserved",
                 "financial_years": None, "bases": None,
                 "report_codes": None, "disclosure_days": None,
@@ -621,6 +624,10 @@ class Fundamentals:
     def query_data(self, view="sources", source_key=None, corp_code=None, endpoint=None,
                    field=None, text=None, offset=0, limit=20):
         self._page(offset, limit)
+        if view == "files" and corp_code is not None:
+            if any(x is not None for x in (source_key, field, text)):
+                raise ValueError("stock files uses corp_code and optional endpoint only")
+            return self.stock_folders.report(corp_code, endpoint, offset, limit)
         if source_key is not None:
             if not isinstance(source_key, str) or len(source_key) > 160:
                 raise ValueError("invalid source_key")
