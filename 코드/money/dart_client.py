@@ -11,14 +11,13 @@ import zipfile
 
 BASE = "https://opendart.fss.or.kr/api/"
 MAX_BYTES = 64 * 1024 * 1024
+BINARY_ENDPOINTS = {"corpCode.xml", "document.xml", "fnlttXbrl.xml"}
 
 
 def validate_request(endpoint, params):
     # Only relative OpenDART read endpoints; callers cannot supply another host,
     # URL query, path, or credential. The local key is attached by the transport.
-    if not isinstance(endpoint, str) or not (
-            re.fullmatch(r"[A-Za-z][A-Za-z0-9]*\.json", endpoint)
-            or endpoint in {"corpCode.xml", "document.xml", "fnlttXbrl.xml"}):
+    if not isinstance(endpoint, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9]*\.(json|xml)", endpoint):
         raise DartError("unsupported_endpoint")
     if not isinstance(params, dict) or any(
             not isinstance(k, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", k)
@@ -63,6 +62,13 @@ class DartClient:
         self.opener, self.sleep = opener, sleep
         self.last_call = 0.0
         self.before_request = lambda: None
+        self.archive = None
+
+    def _receive(self, endpoint, params, response, status):
+        if self.archive is not None:
+            return self.archive.receive(endpoint, params, response, status)
+        raw = response.read(MAX_BYTES + 1)
+        return (raw if len(raw) <= MAX_BYTES else None), None
 
     def get(self, endpoint, params):
         validate_request(endpoint, params)
@@ -73,30 +79,49 @@ class DartClient:
             self.before_request()
             self.sleep(max(0, self.interval - (time.monotonic() - self.last_call)))
             self.last_call = time.monotonic()
+            request_id = None
             try:
-                with self.opener(BASE + endpoint + "?" + query, timeout=30) as response:
-                    raw = response.read(MAX_BYTES + 1)
-                if len(raw) > MAX_BYTES:
-                    raise DartError("response_size")
-                if not endpoint.endswith(".json"):
-                    unpack(raw)  # Validate errors and expanded size before caching.
-                    return raw
                 try:
-                    result = json.loads(raw)
-                except (ValueError, UnicodeError):
-                    raise DartError("invalid_json") from None
-                if not isinstance(result, dict) or not isinstance(result.get("status"), str):
-                    raise DartError("invalid_response")
-                if result["status"] not in {"000", "013"}:
-                    raise DartError(result["status"])
+                    response = self.opener(BASE + endpoint + "?" + query, timeout=30)
+                except HTTPError as exc:
+                    with exc:
+                        _, request_id = self._receive(endpoint, params, exc, exc.code)
+                    raise DartError("http_" + str(exc.code)) from None
+                with response:
+                    raw, request_id = self._receive(endpoint, params, response, getattr(response, "status", 200))
+                if raw is None:
+                    raise DartError("response_size")
+                if endpoint in BINARY_ENDPOINTS:
+                    unpack(raw)  # Validate errors and expanded size before caching.
+                    result = raw
+                elif endpoint.endswith(".xml"):
+                    root = xml_root(raw)
+                    status = root.findtext("status")
+                    if status not in {"000", "013"}:
+                        raise DartError(status or "invalid_response")
+                    result = raw
+                else:
+                    try:
+                        result = json.loads(raw)
+                    except (ValueError, UnicodeError):
+                        raise DartError("invalid_json") from None
+                    if not isinstance(result, dict) or not isinstance(result.get("status"), str):
+                        raise DartError("invalid_response")
+                    if result["status"] not in {"000", "013"}:
+                        raise DartError(result["status"])
+                if self.archive is not None:
+                    self.archive.finish(request_id)
                 return result
-            except HTTPError as exc:
-                code = "http_" + str(exc.code)
-                retry = exc.code == 429 or exc.code >= 500
             except (URLError, TimeoutError, OSError):
                 code, retry = "network_error", True
+                if self.archive is not None:
+                    self.archive.failure(endpoint, params, code)
             except DartError as exc:
-                code, retry = exc.code, exc.code in {"800", "900"}
+                code = exc.code
+                retry = (code in {"800", "900", "incomplete_response"}
+                         or code == "http_429" or code.startswith("http_5"))
+            if self.archive is not None:
+                self.archive.finish(request_id, code)
             if not retry or attempt == 2:
                 raise DartError(code) from None
             self.sleep(2 ** attempt)

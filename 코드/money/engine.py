@@ -742,6 +742,12 @@ class Engine:
             raise ValueError("OpenDART collector is not configured")
         return self.fundamentals.evidence(source_key, offset, limit)
 
+    def query_dart_data(self, view="sources", source_key=None, corp_code=None, endpoint=None,
+                        field=None, text=None, offset=0, limit=20):
+        if self.fundamentals is None:
+            raise ValueError("OpenDART is not configured")
+        return self.fundamentals.query_data(view, source_key, corp_code, endpoint, field, text, offset, limit)
+
     def diagnostic(self, part, date=None):
         """Independent read-only US queries for an operator; no plans or orders."""
         with self.lock:

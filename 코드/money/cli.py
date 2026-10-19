@@ -34,7 +34,8 @@ def load_env(path):
 def main():
     p = argparse.ArgumentParser(description="Work analysis → Termux Kiwoom DEMO execution")
     p.add_argument("command", choices=["init", "credentials", "run", "import-plan", "status", "mcp-url",
-        "dart-credentials", "dart-status", "dart-show", "dart-export", "dart-api"])
+        "dart-credentials", "dart-status", "dart-show", "dart-export", "dart-api",
+        "dart-query", "dart-verify", "dart-migrate"])
     p.add_argument("--root", default=".")
     p.add_argument("--market", choices=["KR", "US"])
     p.add_argument("--file")
@@ -47,6 +48,12 @@ def main():
     p.add_argument("--params", default="{}", help="JSON OpenDART parameters; key is read locally")
     p.add_argument("--refresh", action="store_true")
     p.add_argument("--include-data", action="store_true")
+    p.add_argument("--source-key")
+    p.add_argument("--corp-code")
+    p.add_argument("--view", choices=["sources", "fields", "requests", "files"], default="sources")
+    p.add_argument("--field")
+    p.add_argument("--text")
+    p.add_argument("--all", action="store_true", help="dart-migrate: process all local legacy versions in batches")
     p.add_argument("--public-origin", help="HTTPS tunnel origin, e.g. https://your-private-host.example")
     args = p.parse_args()
     root = Path(args.root).resolve()
@@ -114,6 +121,17 @@ def main():
             result = dart.call_api(args.endpoint, json.loads(args.params), args.refresh, args.include_data)
         elif args.command == "dart-status":
             result = dart.status()
+        elif args.command == "dart-query":
+            result = dart.query_data(args.view, args.source_key, args.corp_code, args.endpoint,
+                                     args.field, args.text, args.offset, args.limit)
+        elif args.command == "dart-verify":
+            result = dart.verify_archive(args.offset, args.limit)
+        elif args.command == "dart-migrate":
+            while True:
+                result = dart.migrate_archive(args.limit)
+                if not args.all or result["complete"]:
+                    break
+                print(json.dumps(result, ensure_ascii=False), flush=True)
         elif args.command == "dart-export":
             if not args.file:
                 raise SystemExit("--file DESTINATION.sqlite is required")

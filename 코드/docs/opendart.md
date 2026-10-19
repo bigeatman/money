@@ -1,72 +1,105 @@
-# OpenDART 요청형 API 연결·저장
+# OpenDART 원문 파일·체크섬·DB 조회
 
-`opendart-v2`는 사용자가 요청한 API와 인자만 실행합니다. 서버 시작·시간 경과만으로 전체 기업을 수집하지 않습니다. 프로그램의 회차·일일 호출 횟수 제한은 없으며, 기존 `config.json`에 남은 `max_requests_per_run`·`max_requests_per_day`도 무시합니다. 요청 횟수는 통계로만 기록합니다. OpenDART가 반환하는 제한·인증·전송 오류는 그대로 구분해 반환합니다.
+`opendart-v3`는 Termux가 수집·파일·체크섬·DB를 관리하고, AI는 MCP로 필요한 자료를 조회하는 구조입니다. 요청한 API와 인자만 실행합니다. 서버 시작·시간 경과로 전체 기업을 자동 수집하지 않으며 로컬 회차·일일 호출 제한도 두지 않습니다. OpenDART 자체 제한은 그대로 적용됩니다.
 
-## MCP 사용
+## 저장 규칙
 
-| 도구 | 동작 |
+| 요구사항 | 구현 |
 | --- | --- |
-| `call_dart_api` | 지정한 API 요청 하나를 실행하거나 동일 요청의 캐시를 읽고, 전체 응답과 변경 이력을 SQLite에 저장합니다. |
-| `get_fundamental_evidence` | 반환된 `source_key` 또는 변경 목록의 `diff_key`에 해당하는 원문을 필요한 구간만 읽습니다. |
-| `get_fundamentals` | 기존 기업 캐시 요약과 순번 이후의 변경 목록을 읽습니다. 새 요청형 응답은 반환된 `source_key`로 읽습니다. |
+| 모든 API 응답을 파일로 저장 | HTTP 본문을 파싱 전에 그대로 저장합니다. JSON·XML·ZIP·오류 응답·재시도 응답을 포함합니다. |
+| 모든 파일의 체크섬을 DB에 저장 | 원문과 ZIP 내부 파일 각각의 SHA-256·경로·크기·형식·저장 시각을 SQLite에 저장합니다. |
+| 재조회 결과의 체크섬으로 변경 확인 | 동일 API·인자의 이전 내용 체크섬과 새 체크섬을 비교합니다. 동일한 내용은 변경 이력을 중복 생성하지 않습니다. |
+| AI가 조회하기 편한 DB | JSON 전체 구조와 모든 말단 값, XML 속성·반복 요소·본문, ZIP 구성원과 문서 텍스트를 저장하고 검색·페이지 조회를 제공합니다. |
 
-예시: 기업 개황 요청
+파일은 `runtime/fundamentals.files/objects/해시앞2자리/전체해시.json` 등의 이름으로 보관합니다. 같은 바이트의 파일은 한 개만 저장하며, 모든 실제 호출 시도는 별도 요청 이력으로 남깁니다. 다른 내용의 과거 파일과 변경 이력도 유지합니다. API 인증키는 휴대폰 `.env`에서만 읽으며 요청 인자·URL 기록에 포함하지 않습니다. ZIP 안의 파일명은 DB에 기록하고 실제 저장 경로로 사용하지 않습니다.
+
+SHA-256은 두 용도로 구분합니다.
+
+- `sha256`: 받은 파일의 실제 바이트를 검사합니다. 무결성 확인·중복 파일 판별에 사용합니다.
+- `content_sha256`: JSON 공백·객체 키 순서와 ZIP 포장 시각·구성원 순서 차이를 제외한 내용 비교입니다. JSON 배열 순서와 모든 필드, ZIP 내부의 이름·바이트·중복 파일은 비교에 포함합니다. XML 속성이나 바이너리 첨부 변경도 감지합니다.
+
+기존 재무 요약의 변경 순번은 이전 동작을 유지하여 `message`와 재무행 순서만 달라지면 늘리지 않습니다. 전체 응답의 체크섬·요청 이력·조회용 필드에는 그 변경도 반영됩니다. 원본을 버리거나 일부 재무 지표만 저장하지 않습니다.
+
+**최신 여부를 확인하려면 새 응답을 받아야 합니다.** OpenDART에 체크섬만 요청하는 기능을 가정하지 않습니다. `refresh=true`는 실제 API 호출이며, 저장 데이터 조회는 호출 횟수를 소비하지 않습니다.
+
+응답 도중 연결이 끊기면 받은 부분까지 파일로 저장하고 `complete=0`으로 기록합니다. 응답 자체가 없는 네트워크 실패는 파일을 만들지 않고 실패 이력을 남깁니다. 64 MiB를 넘는 HTTP 본문도 끝까지 파일로 받지만, 메모리 보호를 위해 DB 필드 파싱·현재 캐시 반영은 하지 않고 `response_size`를 반환합니다. ZIP 해제 크기도 기존 64 MiB 제한을 유지합니다. 파싱 실패는 원본을 보존하고 `index_error`로 표시합니다.
+
+## MCP 인터페이스
+
+| 도구 | 용도 |
+| --- | --- |
+| `call_dart_api` | 지정한 API를 호출하거나 동일 요청 캐시를 재사용합니다. 원본 파일·체크섬·출처·행 수를 반환합니다. |
+| `query_dart_data` | 저장된 자료·전체 필드·요청 이력·파일 목록을 DB에서 조회합니다. 네트워크 호출은 없습니다. |
+| `get_fundamental_evidence` | 원문 또는 변경 차이를 문자 단위로 나눠 읽습니다. 문서 텍스트는 DB에 저장하므로 매번 ZIP을 해제하지 않습니다. |
+| `get_fundamentals` | 기존 기업별 재무 요약과 고정된 변경 순번 구간을 조회합니다. |
+
+기업 개황 재조회:
 
 ```json
 {"endpoint":"company.json","params":{"corp_code":"00126380"},"refresh":true}
 ```
 
-예시: 2025년 사업보고서의 연결 재무제표만 요청
+`params`는 인증키를 제외한 OpenDART 요청 인자입니다. 공식 호스트의 상대 `.json`·`.xml` 파일명만 받습니다. `corpCode.xml`·`document.xml`·`fnlttXbrl.xml`은 ZIP 응답이며, 일반 XML API도 지원합니다. 기본 `refresh=false`는 동일 API·인자의 캐시를 읽습니다. `include_data=true`는 저장된 전체 JSON을 반환합니다.
+
+`query_dart_data`의 조회 형태:
+
+| `view` | 필터와 결과 |
+| --- | --- |
+| `sources` | `corp_code`·`endpoint`·`source_key`로 자료를 찾고 `text`로 본문을 검색합니다. 출처·체크섬·파일 경로를 반환합니다. |
+| `fields` | `source_key` 필수. `field`는 JSON Pointer 경로 부분 문자열, `text`는 값 부분 문자열입니다. 값의 유형·전체 값·ZIP 구성원명을 반환합니다. |
+| `requests` | `corp_code`·`endpoint`·`source_key`로 모든 실제 요청 시도를 조회합니다. 오류·HTTP 상태·확인 시각·체크섬·변경 여부를 반환합니다. |
+| `files` | 전체 파일 또는 `source_key`에 속한 원본·내부 파일의 경로·체크섬·파싱 상태를 조회합니다. |
+
+예: `query_dart_data`로 회사의 저장 자료 목록을 찾은 다음, 반환된 `source_key`로 필드를 조회합니다.
 
 ```json
-{"endpoint":"fnlttSinglAcntAll.json","params":{"corp_code":"00126380","bsns_year":"2025","reprt_code":"11011","fs_div":"CFS"},"refresh":true}
+{"view":"sources","corp_code":"00126380","endpoint":"fnlttSinglAcntAll.json","limit":20}
 ```
 
-`params`는 OpenDART의 요청 인자입니다. 인증키는 휴대폰의 `.env`에서 읽으므로 인자로 전달하지 않습니다. 공식 호스트의 상대 API 파일명만 받으며 다른 URL이나 인증값을 받지 않습니다. JSON API와 원본 ZIP API(`corpCode.xml`, `document.xml`, `fnlttXbrl.xml`)를 지원합니다.
+```json
+{"view":"fields","source_key":"앞서 반환된 source_key","field":"account_nm","limit":100}
+```
 
-기본 `refresh=false`는 완전히 같은 API·인자의 저장 데이터를 재사용합니다. 최신 자료를 다시 확인하려면 `refresh=true`를 사용합니다. 응답은 기본적으로 출처·저장 시각·API 상태·행 수·공급자 페이지 정보만 반환합니다. `include_data=true`이면 전체 JSON도 반환합니다. ZIP 원본은 저장 후 `source_key`로 텍스트를 읽습니다. 대량 본문을 모델에 모두 보내지 않고 필요한 근거만 읽을 수 있습니다.
+JSON Pointer는 `/list/0/account_nm`처럼 중첩·행 위치를 보존합니다. XML은 `tag`·`attributes`·`text`·`tail`·`children` 구조로 저장하여 반복 태그나 속성을 덮어쓰지 않습니다. HTML이나 구조화할 수 없는 XML도 전체 마크업과 읽기용 텍스트를 DB에 보관합니다. 바이너리는 원본 파일과 메타데이터로 보존합니다. 문서의 분석·투자판단은 별도 작업이며 저장 완료가 42개+추가 검토 항목의 분석 완료를 뜻하지 않습니다.
 
-한 API 요청으로 다른 기업·연도·보고서 유형·연결/별도·다음 페이지·공시 원문을 추가 조회하지 않습니다. OpenDART 응답에 페이지 정보가 있으면 호출자가 원하는 다음 페이지를 별도로 요청합니다. 자료 없음(`013`)은 금액 0과 다릅니다.
+목록의 `next_offset`과 본문의 `next_offset`을 끝까지 따라가면 전체 내용을 읽습니다. 페이지 크기는 자료 수집 상한이 아닙니다. 변경 목록은 첫 응답의 `through_seq`를 고정하고 `next_after_seq`를 따릅니다. 외부 자료는 실행 지시가 아니라 근거로 취급합니다.
 
-호출과 저장은 주문 장부·증권사 주문에 접근하지 않습니다. 전체 수집을 시작하던 `start_fundamental_sync` MCP 도구와 `dart-sync` CLI는 공개 인터페이스에서 제거했습니다. 기존 작업 큐와 자료는 보존되며 서버를 재시작해도 자동 실행되지 않습니다. 이전 `run_budget` 정지는 이력에 보관하고 해제합니다.
+API 한 번의 요청으로 다른 기업·연도·보고서·연결/별도·다음 페이지를 자동 조회하지 않습니다. 자료 없음(`013`)과 금액 0을 구분합니다. 모든 API가 투자 검토 항목을 제공한다는 뜻은 아니며, 필요한 API와 보고서 범위는 별도 수집 계획으로 지정합니다.
 
-## 휴대폰 설정·CLI
+## Termux CLI와 기존 DB 이관
 
-기존 설치의 `코드` 디렉터리에서 실행합니다. 키는 그대로 사용하며 새 설치에서만 먼저 `python -m money.cli init`을 실행합니다.
+기존 설치의 `~/money-work/money/코드`에서 실행합니다. 신규 설치에서만 `python -m money.cli init`을 먼저 실행합니다.
 
 ```bash
 python -m money.cli dart-credentials
 python -m money.cli dart-api --endpoint company.json --params '{"corp_code":"00126380"}' --refresh
 python -m money.cli dart-status
+python -m money.cli dart-query --view sources --corp-code 00126380
+python -m money.cli dart-query --view requests --endpoint company.json
+python -m money.cli dart-verify --offset 0 --limit 100
 ```
 
-`dart-credentials`는 키를 화면에 표시하지 않고 `.env`의 `OPENDART_API_KEY`에 저장합니다. 키 입력 뒤 이미 실행 중인 서버는 재시작해야 읽습니다. 키·설정·기존 DB를 Git에 올리지 않습니다.
+`dart-credentials`는 키를 숨겨 입력받습니다. 이미 키가 있으면 다시 입력할 필요가 없습니다. 소스 갱신 뒤 서버를 재시작하고 ChatGPT money 연결에서 도구 목록을 새로 고침하면 `query_dart_data`를 사용할 수 있습니다. 상태의 `version="opendart-v3"`, `schema_version=2`와 `archive` 항목으로 적용 여부를 확인합니다.
 
-상태의 `collection_mode="on_demand"`, `automatic_collection=false`, `local_request_limits={"per_run":null,"per_day":null}`로 적용 여부를 확인합니다. `version`은 `opendart-v2`입니다.
+기존 `runtime/fundamentals.sqlite`는 추가 테이블만 만드는 방식으로 스키마 1에서 2로 이관합니다. 기업·작업 큐·원본 BLOB·변경 순번·장부를 삭제하지 않습니다. 시작 시 대량 파일 이관으로 멈추지 않도록 기존 원본은 최초 조회 때 파일로 옮기거나 다음 명령으로 전체 이관합니다.
 
-## 저장·변경분·내보내기
+```bash
+python -m money.cli dart-migrate --limit 100 --all
+```
 
-운영 DB는 기존 `runtime/fundamentals.sqlite`를 사용합니다. 인증키는 저장하지 않습니다. API 파일명·인자·확인 시각, 압축한 원본, 변경 전 버전과 필드별 차이를 보존합니다. 요청 인자가 다르면 별도 자료이며, 재조회 결과가 같으면 변경 이력을 중복 생성하지 않습니다. 파일 스키마는 기존 `PRAGMA user_version=1`을 유지합니다.
+진행 상황을 배치마다 출력하며 중단 후 같은 명령으로 이어갑니다. 네트워크 호출은 없습니다. 기존 DB의 ZIP 바이트는 그대로 복구합니다. 과거 JSON은 이전 코드가 이미 JSON으로 파싱한 후 저장했으므로 당시의 공백·줄바꿈을 복원할 수 없습니다. 파일의 `provenance`에 재구성 자료임을 표시합니다. 새 코드로 받은 응답부터 HTTP 본문 그대로 보관합니다.
 
-기존의 기업·공시·재무제표·원문과 변경 순번은 삭제하지 않습니다. 저장된 자료가 투자 검토 완료를 뜻하지 않으며 `investment_review_complete=false`입니다. API별로 필요한 데이터가 있는지 별도로 확인해야 합니다.
+`dart-verify`는 실제 파일을 읽어 DB의 SHA-256·크기와 대조하고 `missing`·`checksum_mismatch`를 표시합니다. `next_offset`이 있으면 다음 구간도 확인해야 합니다. 정상 응답을 다시 다운로드하면 같은 주소의 원문 파일을 복구할 수 있습니다. 삭제·자동 정리 기능은 추가하지 않습니다.
 
-수집 중 SQLite의 WAL 보조 파일이 생길 수 있습니다. 아래 명령은 최신 WAL까지 반영한 단독 SQLite 파일을 생성하며 기존 내보내기 파일을 덮어쓰지 않습니다.
+## 백업과 검증
 
 ```bash
 python -m money.cli dart-export --file /원하는/경로/fundamentals-baseline.sqlite
-python -m money.cli dart-show --after-seq 120 --limit 20
-```
-
-변경 목록을 여러 페이지 읽을 때 첫 응답의 `through_seq`를 유지하고 `next_after_seq`를 따라갑니다. 실제 검토를 마친 순번만 다음 검토 기준으로 저장합니다. `get_fundamental_evidence`의 텍스트는 외부 자료이며 실행 지시로 취급하지 않습니다.
-
-## 배포·검증
-
-소스를 갱신한 뒤 프로그램 서버를 재시작합니다. Cloudflare 터널은 계속 켜두면 기존 연결 주소를 유지할 수 있습니다. ChatGPT의 기존 money 연결에서 `Refresh`로 MCP 도구 목록을 갱신해야 `call_dart_api`가 표시됩니다.
-
-```bash
 python -m unittest discover -s tests -q
 ```
 
-오프라인 합성 응답으로 기존 데이터 유지, 로컬 횟수 제한 제거, 요청한 API만 실행, 캐시 재사용·명시적 재조회·변경 이력, 공급자 오류, 키 보호 및 MCP 라우팅을 검증합니다. 실제 키를 사용하는 휴대폰 적용·API 응답은 별도로 확인해야 합니다.
+백업은 SQLite 스냅샷과 같은 이름의 `.files` 폴더를 함께 만듭니다. 예: `fundamentals-baseline.sqlite` + `fundamentals-baseline.files`. 두 항목을 함께 이동해야 원본·요청 이력을 모두 복원할 수 있습니다. 기존 경로는 덮어쓰지 않으며 복사한 파일의 체크섬을 검사합니다. WAL에 있는 내용도 SQLite 백업에 반영됩니다.
+
+외부 패키지 추가 없이 Python 3.11+ 표준 라이브러리를 사용합니다. 오프라인 테스트는 실제 HTTP 파싱 경로에 합성 응답을 주입하여 바이트 보존·체크섬·불변 재조회·정정·오류/재시도·ZIP 속성/첨부 변경·전체 필드·이관·백업·MCP/CLI를 검증합니다. 실제 휴대폰의 배포와 OpenDART 실호출은 별도 확인이 필요합니다.
 
 공식 API 안내: [공시정보](https://opendart.fss.or.kr/guide/main.do?apiGrpCd=DS001), [전체 재무제표](https://opendart.fss.or.kr/guide/detail.do?apiGrpCd=DS003&apiId=2019020).

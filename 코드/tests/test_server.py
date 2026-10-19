@@ -48,7 +48,7 @@ class ServerTests(unittest.TestCase):
         self.assertEqual({t["name"] for t in data["result"]["tools"]},
                          {"get_trading_snapshot", "submit_trading_plan", "get_execution_status",
                           "start_market_scan", "get_market_scan", "get_market_context",
-                          "call_dart_api", "get_fundamentals", "get_fundamental_evidence"})
+                          "call_dart_api", "query_dart_data", "get_fundamentals", "get_fundamental_evidence"})
         _, data = self.rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                            "params": {"name": "get_execution_status", "arguments": {}}})
         self.assertFalse(data["result"]["isError"])
@@ -115,7 +115,9 @@ class ServerTests(unittest.TestCase):
             ("get_fundamentals", {"symbol": "005930", "after_seq": 4, "through_seq": 9, "limit": 2},
              "fundamental_report", ("005930", 4, 0, 2, 9)),
             ("get_fundamental_evidence", {"source_key": "change:9", "offset": 8, "limit": 90},
-             "fundamental_evidence", ("change:9", 8, 90))]
+             "fundamental_evidence", ("change:9", 8, 90)),
+            ("query_dart_data", {"view": "fields", "source_key": "fixture", "field": "account_nm", "limit": 5},
+             "query_dart_data", ("fields", "fixture", None, None, "account_nm", None, 0, 5))]
         for name, args, method, expected in cases:
             with self.subTest(name=name), patch.object(self.engine, method, return_value={"read_only": True}) as read:
                 _, result = self.rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/call",

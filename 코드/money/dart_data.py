@@ -66,7 +66,9 @@ def row_key(row):
 
 def changes(old, new):
     """Keep all differences in SQLite; the reader pages the JSON evidence."""
-    if isinstance(new, dict) and isinstance(new.get("list"), list):
+    if (isinstance(new, dict) and isinstance(new.get("list"), list)
+            and all(isinstance(row, dict) for row in new["list"])
+            and (old is None or isinstance(old, dict) and all(isinstance(row, dict) for row in old.get("list", [])))):
         def keyed(value):
             out = {}
             for row in (value or {}).get("list", []):
@@ -80,7 +82,11 @@ def changes(old, new):
     elif isinstance(new, dict):
         left, right = old or {}, new
     else:
-        return {"kind": "document", "new_text_chars": len(document_text(new))}
+        try:
+            text_chars = len(document_text(new))
+        except DartError:
+            text_chars = None
+        return {"kind": "document", "new_bytes": len(new), "new_text_chars": text_chars}
     result = []
     for key in sorted(left.keys() | right.keys()):
         a, b = left.get(key), right.get(key)
