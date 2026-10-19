@@ -125,6 +125,22 @@ class DartFolders:
             except BlockingIOError:
                 raise ValueError("stock folder is being organized; retry after it finishes") from None
             requests, objects, legacy = self._records(corp)
+            selection = None
+            manifest_path = folder / "MANIFEST.json"
+            if manifest_path.is_file():
+                selection = json.loads(manifest_path.read_text(encoding="utf-8")).get("selection")
+            if selection is not None:
+                ids = selection.get("request_ids")
+                if (selection.get("mode") != "exact_requests"
+                        or selection.get("corp_code") != corp
+                        or not isinstance(ids, list) or not ids
+                        or any(type(x) is not int or x < 1 for x in ids)
+                        or len(ids) != len(set(ids))):
+                    raise ValueError("invalid current-collection selection")
+                requests = [r for r in requests if r["id"] in set(ids)]
+                if {r["id"] for r in requests} != set(ids):
+                    raise ValueError("current-collection request record missing")
+                legacy = []
             rows, bodyless = [], []
             for request in requests:
                 row = {k: v for k, v in request.items() if k not in {"params"}}
@@ -150,7 +166,8 @@ class DartFolders:
                     "legacy": True})
             manifest = {"corp_code": corp, "raw_response_files": len(rows),
                 "attempts_without_body": bodyless, "files": rows,
-                "network_requests": 0, "source": "existing_local_archive",
+                "network_requests": 0, "source": "exact_requests" if selection else "existing_local_archive",
+                "selection": selection,
                 "legacy_note": "Legacy JSON, when present, is reconstructed and is not historical HTTP bytes."}
             self._atomic(folder / "MANIFEST.json", json.dumps(manifest, ensure_ascii=False, indent=2).encode())
             paths = sorted([r["response_file"] for r in rows] + ["MANIFEST.json", "TREE.json"])
