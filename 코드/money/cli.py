@@ -35,7 +35,7 @@ def main():
     p = argparse.ArgumentParser(description="Work analysis → Termux Kiwoom DEMO execution")
     p.add_argument("command", choices=["init", "credentials", "run", "import-plan", "status", "mcp-url",
         "dart-credentials", "dart-status", "dart-show", "dart-export", "dart-api",
-        "dart-query", "dart-verify", "dart-migrate", "dart-reindex", "dart-job", "dart-reviews"])
+        "dart-query", "dart-verify", "dart-migrate", "dart-reindex", "dart-job", "dart-reviews", "dart-capacity"])
     p.add_argument("--root", default=".")
     p.add_argument("--market", choices=["KR", "US"])
     p.add_argument("--file")
@@ -47,6 +47,7 @@ def main():
     p.add_argument("--endpoint")
     p.add_argument("--params", default="{}", help="JSON OpenDART parameters; key is read locally")
     p.add_argument("--refresh", action="store_true")
+    p.add_argument("--benchmark", action="store_true", help="dart-capacity: local fixture benchmark, no DART calls")
     p.add_argument("--include-data", action="store_true")
     p.add_argument("--source-key")
     p.add_argument("--corp-code")
@@ -123,6 +124,8 @@ def main():
             result = dart.call_api(args.endpoint, json.loads(args.params), args.refresh, args.include_data)
         elif args.command == "dart-status":
             result = dart.status()
+        elif args.command == "dart-capacity":
+            result = dart.collection_job("status", plan={"mode": "capacity", "benchmark": True} if args.benchmark else None)
         elif args.command == "dart-query":
             result = dart.query_data(args.view, args.source_key, args.corp_code, args.endpoint,
                                      args.field, args.text, args.offset, args.limit)
@@ -143,7 +146,8 @@ def main():
         elif args.command == "dart-job":
             if args.file:
                 result = dart.collection_job("start", args.job_id, json.loads(Path(args.file).read_text()))
-                dart.jobs.thread.join()
+                worker = dart.structured if result["job_id"].startswith("structured_") else dart.jobs
+                worker.thread.join()
                 result = dart.collection_job("status", result["job_id"], limit=args.limit)
             else:
                 result = dart.collection_job("status", args.job_id, offset=args.offset, limit=args.limit)

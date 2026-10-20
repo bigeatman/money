@@ -176,7 +176,7 @@ class DartArchive:
                 parts = []
                 for ordinal, (name, body) in enumerate(unpack(raw)):
                     child = self.store(db, body, "archive_member")
-                    db.execute("INSERT INTO archive_members VALUES (?,?,?,?)", (checksum, ordinal, name, child))
+                    db.execute("INSERT OR IGNORE INTO archive_members VALUES (?,?,?,?)", (checksum, ordinal, name, child))
                     child_text = db.execute("SELECT text FROM archive_content WHERE sha256=?", (child,)).fetchone()[0]
                     if child_text:
                         parts.append(name + "\n" + child_text)
@@ -220,8 +220,12 @@ class DartArchive:
                     readable = ""
                 # Keep markup (including attributes) in the DB as well.
                 text = text if not readable else readable + "\n\n" + text
-        db.execute("INSERT INTO archive_content VALUES (?,?,?,?)",
-                   (checksum, dumps(structured) if structured is not None else None, text, error))
+        inserted = db.execute("INSERT OR IGNORE INTO archive_content VALUES (?,?,?,?)",
+                              (checksum, dumps(structured) if structured is not None else None, text, error))
+        # Identical bodies can arrive on different HTTP workers. Only the
+        # transaction that inserted the content also inserts its scalar fields.
+        if not inserted.rowcount:
+            return
         if structured is not None:
             try:
                 db.executemany("INSERT INTO archive_fields VALUES (?,?,?,?)",
@@ -295,7 +299,7 @@ class DartArchive:
                         self._index(db, checksum, raw)
                 except Exception:
                     with self.connect() as db:
-                        db.execute("INSERT OR REPLACE INTO archive_content VALUES (?,NULL,'','index_failed')", (checksum,))
+                        db.execute("INSERT OR IGNORE INTO archive_content VALUES (?,NULL,'','index_failed')", (checksum,))
             else:
                 with self.connect() as db:
                     db.execute("INSERT OR IGNORE INTO archive_content VALUES (?,NULL,'',?)",

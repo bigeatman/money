@@ -163,6 +163,8 @@ V7은 전체 종목 목록을 먼저 읽고 정책 제외를 기록한 다음 �
 
 ## 검증
 
+종목 목록을 받아 D3를 제외한 OpenDART 수집·가공·DB 저장을 실행하는 방법과 휴대폰 병렬 수 진단은 [구조화 수집 안내](docs/dart_structured.md)를 참고합니다.
+
 ```bash
 python -m unittest discover -s tests -v
 ```

@@ -24,6 +24,7 @@ from .dart_data import changes, document_text, dumps, metrics
 from .dart_archive import DartArchive, content_hash, media_type
 from .dart_jobs import DartJobs
 from .dart_folders import DartFolders
+from .dart_structured import StructuredCollector, benchmark_capacity, capacity
 
 VERSION = "opendart-v4"
 SCHEMA = 2
@@ -89,6 +90,7 @@ class Fundamentals:
         self.jobs = DartJobs(self)
         self.stock_folders = DartFolders(self)
         self.client.archive = self.archive
+        self.structured = StructuredCollector(self)
         with self.db() as db:
             db.execute("PRAGMA user_version=2")
         self.path.chmod(0o600)
@@ -123,7 +125,8 @@ class Fundamentals:
         with self.db() as db:
             db.execute("INSERT OR IGNORE INTO usage VALUES (?,0)", (day,))
             db.execute("UPDATE usage SET requests=requests+1 WHERE day=?", (day,))
-        self.requests += 1
+        with self.lock:
+            self.requests += 1
 
     def call_api(self, endpoint, params=None, refresh=False, include_data=False):
         """Execute only the specified API request, or reuse its exact cache entry.
@@ -488,6 +491,7 @@ class Fundamentals:
 
     def close(self):
         self.stop.set()
+        self.structured.close()
         self.jobs.close()
         if self.thread:
             self.thread.join(35)
@@ -654,6 +658,31 @@ class Fundamentals:
                        view="requests", symbol=None, offset=0, limit=20):
         if not isinstance(retry_failed, bool):
             raise ValueError("retry_failed must be boolean")
+        if action == "status" and job_id is None:
+            if plan is not None:
+                if plan != {"mode": "capacity", "benchmark": True}:
+                    raise ValueError("capacity plan must be {mode: capacity, benchmark: true}")
+                with self.path.with_suffix(".jobs.lock").open("a+") as lock:
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        raise ValueError("wait for active collection before benchmarking") from None
+                    result = benchmark_capacity(self.path.parent)
+                    self._set_meta("structured_device_benchmark", result)
+            measured = self._meta("structured_device_benchmark")
+            info = capacity()
+            info["maximum_tested_on_this_device"] = measured["maximum_verified_workers"] if measured else None
+            return {"mode": "capacity", "capacity": info, "benchmark": measured,
+                    "last_execution": self._meta("structured_last_execution"), "read_only": plan is None}
+        structured = (isinstance(plan, dict) and plan.get("mode") == "structured"
+                      or isinstance(job_id, str) and job_id.startswith("structured_"))
+        if structured:
+            if view != "requests":
+                raise ValueError("structured jobs expose requests, not investment reviews")
+            if action == "start":
+                return self.structured.start(plan, job_id, retry_failed)
+            if action == "status":
+                return self.structured.report(job_id, offset, limit, symbol)
         if action == "start":
             return self.jobs.start(job_id, plan, retry_failed)
         if action == "status":

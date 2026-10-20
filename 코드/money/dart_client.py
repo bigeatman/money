@@ -2,6 +2,7 @@
 import io
 import json
 import re
+import threading
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -63,8 +64,22 @@ class DartClient:
         self.last_call = 0.0
         self.before_request = lambda: None
         self.archive = None
+        self.rate_lock = threading.Lock()
+        self.local = threading.local()
 
     def _receive(self, endpoint, params, response, status):
+        client = self
+        original = response
+        class TimedReader:
+            def read(self, size=-1):
+                value = original.read(size)
+                client.local.received_at = time.monotonic()
+                return value
+
+            def getheader(self, name):
+                return original.getheader(name) if hasattr(original, "getheader") else None
+
+        response = TimedReader()
         if self.archive is not None:
             return self.archive.receive(endpoint, params, response, status)
         raw = response.read(MAX_BYTES + 1)
@@ -75,10 +90,15 @@ class DartClient:
         if not self.api_key:
             raise DartError("missing_key")
         query = urlencode({**params, "crtfc_key": self.api_key})
+        self.local.attempts = 0
+        self.local.received_at = None
         for attempt in range(3):
             self.before_request()
-            self.sleep(max(0, self.interval - (time.monotonic() - self.last_call)))
-            self.last_call = time.monotonic()
+            self.local.attempts += 1
+            # Space starts globally, but never hold the gate during network I/O.
+            with self.rate_lock:
+                self.sleep(max(0, self.interval - (time.monotonic() - self.last_call)))
+                self.last_call = time.monotonic()
             request_id = None
             try:
                 try:

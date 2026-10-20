@@ -25,6 +25,7 @@ TABLES = {
     "archive_requests", "archive_heads", "archive_sources", "archive_versions",
     "archive_data_hashes", "archive_parse_notes", "dart_jobs", "dart_job_requests",
     "dart_reviews", "dart_review_history",
+    "structured_jobs", "structured_requests", "structured_rows", "structured_calculations",
 }
 IDENTITY = {"key", "symbol", "exchange", "name", "asset_type", "segment"}
 
