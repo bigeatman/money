@@ -45,6 +45,8 @@
 python -m money.cli dart-job --job-id structured_기존ID --resume --retry-failed
 ```
 
+기존 조사 자료를 삭제하고 현대차 및 무작위 2종목을 **새 응답으로** 확인하려면 Termux에서 `bash scripts/check-dart-fresh-termux.sh`를 실행한다. 서버를 정상 종료한 뒤 기존 조사 DB·원본을 초기화하고, 새 DART 법인 사전에서 종목코드가 있는 다른 법인 2개를 무작위 추출한다. 종목 목록·키·설정·매매 장부는 보존한다. 2025년 4개 보고서의 연결·별도와 D1·D2·D5~D14를 `refresh=true`로 수집하고, 종목별 처리 오류·캐시 사용·누락 필드·저장 행 수를 검사한다. D3는 호출하지 않는다. 결과 작업 ID는 `structured_fresh_three`, 요약은 `runtime/dart-fresh-check.json`이다. 초기화·법인 사전 처리 시간과 실제 세 종목 수집 시간을 별도로 표시하며, 실패해도 Python 서버를 다시 시작한다.
+
 ```json
 {"action":"status","job_id":"structured_반환된ID","limit":100}
 ```
