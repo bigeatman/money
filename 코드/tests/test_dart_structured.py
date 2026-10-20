@@ -269,7 +269,7 @@ class StructuredTests(unittest.TestCase):
         self.assertEqual(out["capacity"]["sqlite_concurrent_writers"], 1)
         self.assertEqual(self.provider.calls, [])
 
-    def test_auditor_unknown_year_is_preserved_and_real_scope_mismatch_rejected(self):
+    def test_auditor_unknown_and_comparative_years_are_preserved_but_other_corps_rejected(self):
         self.plan.update(apis=["D10"], report_codes=["11011"])
         def audit_row(year):
             return {"status": "000", "list": [{"corp_code": "00164742", "bsns_year": year,
@@ -284,6 +284,13 @@ class StructuredTests(unittest.TestCase):
         self.assertEqual(stored["provider"]["adtor"], "-")
         self.assertNotIn("adt_opinion", stored["provider"])
         self.provider.override = lambda e, p: audit_row("2024")
+        changed = self.run_job({**self.plan, "refresh": True})
+        self.assertTrue(changed["collection_complete"], changed)
+        def other_corp(e, p):
+            result = audit_row("2025")
+            result["list"][0]["corp_code"] = "00126380"
+            return result
+        self.provider.override = other_corp
         changed = self.run_job({**self.plan, "refresh": True})
         self.assertFalse(changed["collection_complete"])
         self.assertEqual(changed["rows"][0]["error"], "response_scope_mismatch")

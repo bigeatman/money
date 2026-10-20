@@ -9,8 +9,8 @@ import zlib
 
 TARGETS = ["money/common.py", "money/engine.py", "money/kiwoom.py", "money/server.py", "money/cli.py",
            "money/dart_client.py", "money/dart_data.py", "money/dart_archive.py", "money/fundamentals.py",
-           "money/dart_xml.py", "money/dart_jobs.py", "money/dart_folders.py", "money/dart_structured.py",
-           "tests/test_fundamentals.py", "tests/test_dart_archive.py", "tests/test_dart_jobs.py", "tests/test_dart_folders.py", "tests/test_dart_structured.py",
+           "money/dart_xml.py", "money/dart_jobs.py", "money/dart_folders.py", "money/dart_structured.py", "money/dart_calculations.py",
+           "tests/test_fundamentals.py", "tests/test_dart_archive.py", "tests/test_dart_jobs.py", "tests/test_dart_folders.py", "tests/test_dart_structured.py", "tests/test_dart_calculations.py",
            "money/marketdata.py", "money/scanner.py", "tests/test_server.py", "tests/test_scanner.py",
            "tests/test_scanner_installer.py", "scripts/build_scanner_installer.py", "scripts/scanner_installer_template.py"]
 

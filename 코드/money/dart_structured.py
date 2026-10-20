@@ -2,6 +2,7 @@
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 import fcntl
+import hashlib
 import itertools
 import json
 import math
@@ -13,7 +14,8 @@ import time
 import uuid
 
 from .dart_client import DartError, unpack, xml_root
-from .dart_data import amount, dumps, metrics
+from .dart_data import amount, dumps
+from .dart_calculations import PROCESSOR_VERSION, financial_rows, financial_summary, missing
 
 PERIOD_APIS = {
     "D5": "empSttus.json", "D6": "exctvSttus.json", "D7": "hyslrSttus.json",
@@ -29,7 +31,74 @@ NUMERIC_FIELDS = {
     "frmtrm_add_amount", "bfefrmtrm_amount", "sm", "fyer_salary_totamt", "jan_salary_am",
     "istc_totqy", "tesstk_co", "distb_stock_co", "isu_stock_totqy",
     "now_to_isu_stock_totqy", "now_to_dcrs_stock_totqy", "bsis_posesn_stock_co",
-    "bsis_posesn_stock_qota", "trmend_posesn_stock_co", "trmend_posesn_stock_qota"}
+    "bsis_posesn_stock_qota", "trmend_posesn_stock_co", "trmend_posesn_stock_qota",
+    "bsis_posesn_stock_qota_rt", "trmend_posesn_stock_qota_rt",
+    "rgllbr_co", "rgllbr_abacpt_labrr_co", "cnttk_co", "cnttk_abacpt_labrr_co",
+    "reform_bfe_emp_co_rgllbr", "reform_bfe_emp_co_cnttk", "reform_bfe_emp_co_etc",
+    "redc", "profit_incnr", "rdmstk_repy", "bsis_qy", "change_qy_acqs", "change_qy_dsps",
+    "change_qy_incnr", "trmend_qy", "bsis_blce_acntbk_amount", "bsis_blce_qota_rt",
+    "bsis_blce_qy", "frst_acqs_amount", "incrs_dcrs_acqs_dsps_amount",
+    "incrs_dcrs_acqs_dsps_qy", "incrs_dcrs_evl_lstmn", "trmend_blce_acntbk_amount",
+    "trmend_blce_qota_rt", "trmend_blce_qy", "recent_bsns_year_fnnr_sttus_thstrm_ntpf",
+    "recent_bsns_year_fnnr_sttus_tot_assets", "thstrm", "frmtrm", "lwfr",
+    "isu_dcrs_mstvdv_amount", "isu_dcrs_mstvdv_fval_amount", "isu_dcrs_qy",
+    "mendng_totamt", "mendng_totamt_ct_incls_mendng"}
+
+# Explicit fields checked, not an inference that an empty row means no event.
+CORE_FIELDS = {
+    "company.json": ("corp_name", "stock_code", "ceo_nm", "adres", "induty_code", "acc_mt"),
+    "list.json": ("rcept_no", "rcept_dt", "report_nm"),
+    "fnlttSinglAcntAll.json": ("sj_div", "account_id", "thstrm_amount", "currency"),
+    "empSttus.json": ("sm", "fyer_salary_totamt", "jan_salary_am"),
+    "exctvSttus.json": ("nm", "ofcps", "chrg_job", "main_career"),
+    "hyslrSttus.json": ("nm", "bsis_posesn_stock_co", "bsis_posesn_stock_qota_rt",
+                          "trmend_posesn_stock_co", "trmend_posesn_stock_qota_rt"),
+    "stockTotqySttus.json": ("istc_totqy", "tesstk_co", "distb_stock_co"),
+    "tesstkAcqsDspsSttus.json": ("bsis_qy", "change_qy_acqs", "change_qy_dsps", "change_qy_incnr", "trmend_qy"),
+    "accnutAdtorNmNdAdtOpinion.json": ("adtor", "adt_opinion", "emphs_matter", "core_adt_matter"),
+    "otrCprInvstmntSttus.json": ("inv_prm", "trmend_blce_qy", "trmend_blce_qota_rt", "trmend_blce_acntbk_amount"),
+    "alotMatter.json": ("se", "thstrm", "frmtrm", "lwfr"),
+    "irdsSttus.json": ("isu_dcrs_de", "isu_dcrs_stle", "isu_dcrs_stock_knd", "isu_dcrs_qy",
+                       "isu_dcrs_mstvdv_amount", "isu_dcrs_mstvdv_fval_amount"),
+    PAY_APIS[0]: ("nm", "ofcps", "mendng_totamt"),
+}
+
+
+def row_quality(record, endpoint):
+    checked = set(CORE_FIELDS.get(endpoint, ())) | (set(record) & NUMERIC_FIELDS)
+    absent = sorted(k for k in checked if missing(record.get(k)))
+    invalid = sorted(k for k in checked & NUMERIC_FIELDS if not missing(record.get(k)) and amount(record[k]) is None)
+    state = ("fields_missing" if checked and len(absent) == len(checked) else
+             "partial_fields" if absent or invalid else "available" if checked else "not_assessed")
+    return {"status": state, "checked_fields": sorted(checked), "missing_fields": absent,
+            "invalid_numeric_fields": invalid}
+
+
+def source_quality(payload, rows, derived):
+    counts, absent, invalid = {}, {}, {}
+    for row in rows:
+        quality = row["data_quality"]
+        counts[quality["status"]] = counts.get(quality["status"], 0) + 1
+        for field in quality["missing_fields"]:
+            absent[field] = absent.get(field, 0) + 1
+        for field in quality["invalid_numeric_fields"]:
+            invalid[field] = invalid.get(field, 0) + 1
+    if payload.get("status") == "013":
+        state = "api_no_data"
+    elif counts.get("fields_missing") == len(rows) and rows:
+        state = "fields_missing"
+    elif absent or invalid:
+        state = "partial_fields"
+    else:
+        state = "not_assessed" if counts.get("not_assessed") else "available"
+    unavailable = {}
+    for name, calc in (derived or {}).get("fixed_calculations", {}).items():
+        if calc["status"] != "calculated" or calc.get("unavailable_items", 0):
+            unavailable[name] = calc
+    return {"status": state, "row_states": counts, "missing_fields": absent,
+            "invalid_numeric_fields": invalid, "unavailable_calculations": unavailable,
+            "scope": "explicit checked_fields and fixed formulas; not full DOCX coverage",
+            "missing_value_meaning": "unknown; never zero, no event, or not applicable"}
 
 
 def capacity():
@@ -137,7 +206,7 @@ def normalize(plan):
     return result
 
 
-def calculated(payload, endpoint):
+def calculated(payload, endpoint, params=None):
     """Keep provider rows intact and add only named numeric conversions/formulas."""
     rows = payload.get("list", []) if isinstance(payload, dict) else []
     if endpoint == "company.json" and payload.get("status") == "000":
@@ -148,17 +217,21 @@ def calculated(payload, endpoint):
         raise DartError("invalid_structured_rows")
     if payload.get("status") == "013" and rows:
         raise DartError("invalid_structured_rows")
+    params = params or {}
+    comparisons = financial_rows(rows, params) if endpoint == "fnlttSinglAcntAll.json" else None
     output = []
-    for record in rows:
+    for index, record in enumerate(rows):
         numbers = {key: str(number) if (number := amount(value)) is not None else None
                    for key, value in record.items() if key in NUMERIC_FIELDS}
-        values = {"provider": record, "numeric": numbers}
+        values = {"provider": record, "numeric": numbers, "data_quality": row_quality(record, endpoint)}
+        if comparisons is not None:
+            values["calculated"] = {"comparisons": comparisons[index]}
         if endpoint == "stockTotqySttus.json":
             issued, own = amount(record.get("istc_totqy")), amount(record.get("tesstk_co"))
             values["calculated"] = {"shares_excluding_treasury": str(issued - own) if issued is not None and own is not None else None,
                                     "formula": "istc_totqy - tesstk_co"}
         output.append(values)
-    derived = metrics(payload) if endpoint == "fnlttSinglAcntAll.json" else None
+    derived = financial_summary(payload, params, comparisons) if comparisons is not None else None
     return output, derived
 
 
@@ -234,6 +307,11 @@ class StructuredCollector:
                         db.execute("INSERT INTO structured_jobs VALUES (?,?,?,NULL,?,?,?)",
                                    (job, dumps(validated), "pending", at, at, "{}"))
                     db.execute("UPDATE structured_requests SET state='pending',error=NULL WHERE job=? AND state='running'", (job,))
+                    # Rebuild old processing results from the saved responses;
+                    # a completed HTTP request does not imply current calculations.
+                    for request in db.execute("SELECT source_key,result FROM structured_requests WHERE job=? AND state IN ('available','no_data')", (job,)).fetchall():
+                        if json.loads(request["result"] or "{}").get("processor_version", 0) < PROCESSOR_VERSION:
+                            db.execute("UPDATE structured_requests SET state='pending' WHERE job=? AND source_key=?", (job, request["source_key"]))
                     if retry_failed:
                         db.execute("UPDATE structured_requests SET state='pending',error=NULL WHERE job=? AND state='failed'", (job,))
                     db.execute("UPDATE structured_jobs SET status='running',error=NULL,updated=? WHERE id=?", (at, job))
@@ -247,11 +325,48 @@ class StructuredCollector:
                 raise
         return self.report(job)
 
+    def _saved_audit(self, db, key, endpoint, params):
+        """Recover the validated raw response rejected by the old D10 year bug."""
+        if endpoint != PERIOD_APIS["D10"]:
+            return None
+        saved = db.execute("""SELECT f.path,f.size,f.sha256 FROM archive_heads h
+            JOIN archive_requests r ON r.id=h.request_id JOIN archive_files f ON f.sha256=r.sha256
+            WHERE h.source_key=? AND r.complete=1 AND r.error IS NULL""", (key,)).fetchone()
+        if not saved:
+            return None
+        try:
+            raw = (self.f.archive.root / saved["path"]).read_bytes()
+            if len(raw) != saved["size"] or hashlib.sha256(raw).hexdigest() != saved["sha256"]:
+                return None
+            payload = json.loads(raw)
+            if not isinstance(payload, dict) or payload.get("status") != "000":
+                return None
+            rows = payload.get("list")
+            if not isinstance(rows, list) or not rows:
+                return None
+            for record in rows:
+                if not isinstance(record, dict) or str(record.get("corp_code")) != str(params["corp_code"]):
+                    return None
+                for field in ("bsns_year", "reprt_code", "fs_div"):
+                    # This endpoint's row year describes current/prior periods,
+                    # not an echo of the request year (official DS002/2020009).
+                    if field == "bsns_year":
+                        continue
+                    if field in params and field in record and str(record[field]) != str(params[field]):
+                        return None
+            return payload
+        except (OSError, ValueError, UnicodeError):
+            return None
+
     def _fetch(self, endpoint, params, refresh):
         started = time.monotonic()
         key = self.f.archive.source_key(endpoint, params)
         with self.f.db() as db:
             stored, payload = self.f._stored(db, key)
+            if stored is None and not refresh:
+                payload = self._saved_audit(db, key, endpoint, params)
+                if payload is not None:
+                    stored = {"recovered_archive": True}
         hit = stored is not None and not refresh
         if not hit:
             with self.fetch_guard:
@@ -276,16 +391,21 @@ class StructuredCollector:
         db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", ("request:" + key,
                    dumps({"endpoint": endpoint, "parameters": params, "checked_at": self.f.clock().isoformat()})))
         if isinstance(payload, dict):
-            rows, derived = calculated(payload, endpoint)
+            rows, derived = calculated(payload, endpoint, params)
+            quality = source_quality(payload, rows, derived)
+            if derived is not None:
+                derived["source_key"] = key
+                derived["provider_content_sha256"] = self.f._digest(key, payload)
+                for value in derived["calculation_inputs"].values():
+                    value["source_key"] = key
             db.execute("DELETE FROM structured_rows WHERE source_key=?", (key,))
             db.execute("DELETE FROM structured_calculations WHERE source_key=?", (key,))
             for index, value in enumerate(rows):
                 record = value["provider"]
                 for field in ("corp_code", "bsns_year", "reprt_code", "fs_div"):
-                    # Audit rows can explicitly leave the displayed year blank.
-                    # Preserve the marker; it is unknown, not a different year.
-                    if (endpoint == "accnutAdtorNmNdAdtOpinion.json" and field == "bsns_year"
-                            and record.get(field) in (None, "", "-")):
+                    # Audit rows include current/prior/prior-prior years. Keep
+                    # their labels; the source key retains the requested scope.
+                    if endpoint == PERIOD_APIS["D10"] and field == "bsns_year":
                         continue
                     if field in params and field in record and str(record[field]) != str(params[field]):
                         raise DartError("response_scope_mismatch")
@@ -316,8 +436,8 @@ class StructuredCollector:
             elif endpoint == "fnlttSinglAcntAll.json":
                 alias = "financial:" + ":".join(str(params[k]) for k in ("corp_code", "bsns_year", "reprt_code", "fs_div"))
                 self.f._save(db, alias, corp, payload, availability, request_key=key)
-            return availability, len(rows), derived
-        return availability, 0, None
+            return availability, len(rows), derived, quality
+        return availability, 0, None, {"status": "not_assessed"}
 
     def _resolve(self, plan):
         companies = [dict(c) for c in plan["companies"]]
@@ -473,10 +593,11 @@ class StructuredCollector:
                             fetched = future.result()
                             process_start = time.monotonic()
                             with self.f.db() as db:
-                                availability, count, derived = self._persist(db, row["corp"], row["endpoint"], json.loads(row["params"]), fetched, row["symbol"])
+                                availability, count, derived, quality = self._persist(db, row["corp"], row["endpoint"], json.loads(row["params"]), fetched, row["symbol"])
                                 self._followups(db, job, row, fetched["payload"])
                                 outcome = {"source_key": row["source_key"], "cache_hit": fetched["cache_hit"],
                                     "network_requests": fetched["network_requests"], "normalized_rows": count,
+                                    "processor_version": PROCESSOR_VERSION, "data_quality": quality,
                                     "calculations": derived, "fetch_and_archive_ms": round((fetched["fetched"] - fetched["started"]) * 1000, 3)}
                                 db.execute("UPDATE structured_requests SET state=?,result=?,error=NULL WHERE job=? AND source_key=?",
                                            (availability, dumps(outcome), job, row["source_key"]))
@@ -529,6 +650,18 @@ class StructuredCollector:
             self.f.client.interval = previous_interval
             try:
                 with self.f.db() as db:
+                    quality_counts, calculation_gaps = {}, 0
+                    for request in db.execute("SELECT state,result FROM structured_requests WHERE job=?", (job,)):
+                        result = json.loads(request["result"] or "{}")
+                        quality = result.get("data_quality", {}) if request["state"] in ("available", "no_data") else {}
+                        name = quality.get("status", request["state"])
+                        quality_counts[name] = quality_counts.get(name, 0) + 1
+                        calculation_gaps += bool(quality.get("unavailable_calculations"))
+                    execution["data_quality"] = {"source_states": quality_counts,
+                        "sources_with_unavailable_calculations": calculation_gaps,
+                        "scope": "explicit checked_fields and fixed formulas; not full DOCX coverage"}
+                    execution["data_complete"] = (state == "complete" and not calculation_gaps
+                        and set(quality_counts) <= {"available"} and bool(quality_counts))
                     db.execute("UPDATE structured_jobs SET status=?,error=?,updated=?,execution=? WHERE id=?",
                                (state, error, self.f.clock().isoformat(), dumps(execution), job))
                     db.execute("INSERT OR REPLACE INTO meta VALUES ('structured_last_execution',?)", (dumps(execution),))
@@ -562,10 +695,13 @@ class StructuredCollector:
                     status = "interrupted"
                 except BlockingIOError:
                     pass
+        execution = json.loads(header["execution"])
         return {"job_id": job, "mode": "structured", "status": status, "last_error": header["error"],
                 "counts": counts, "total": sum(counts.values()), "by_company": companies, "rows": rows,
                 "next_offset": offset + limit if len(found) > limit else None,
-                "execution": json.loads(header["execution"]), "collection_complete": status == "complete",
+                "execution": execution, "collection_complete": status == "complete",
+                "data_complete": execution.get("data_complete", False) if status == "complete" else False,
+                "data_quality": execution.get("data_quality"),
                 "D3_excluded": True, "investment_review_complete": False, "read_only": True}
 
     def close(self):

@@ -586,6 +586,12 @@ class Fundamentals:
                     item["stale"] = r["generation"] != r["completed"]
                     item["data"] = metrics(payload) if r["availability"] == "available" else None
                     item["request_basis"] = r["key"].split(":")[2:]
+                    saved = db.execute("SELECT body FROM structured_calculations WHERE corp=? AND year=? AND report=? AND basis=?",
+                                       (corp, *item["request_basis"])).fetchone()
+                    if saved and r["availability"] == "available":
+                        processed = json.loads(saved[0])
+                        if processed.get("provider_content_sha256") == self._digest(r["key"], payload):
+                            item["data"] = processed
                     items.append(item)
                 _, company = self._stored(db, "company:" + corp)
                 return {**status, "issuer": {"corp_code": corp, "symbol": issuer["symbol"], "name": issuer["name"]},

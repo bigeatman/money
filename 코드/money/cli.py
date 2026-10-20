@@ -53,6 +53,8 @@ def main():
     p.add_argument("--corp-code")
     p.add_argument("--view", choices=["sources", "fields", "requests", "files", "text"], default="sources")
     p.add_argument("--job-id")
+    p.add_argument("--resume", action="store_true", help="dart-job: reprocess/resume a saved job")
+    p.add_argument("--retry-failed", action="store_true", help="dart-job --resume: retry failed requests")
     p.add_argument("--after-sha", default="")
     p.add_argument("--field")
     p.add_argument("--text")
@@ -144,8 +146,11 @@ def main():
                 cursor = result["next_after_sha"]
                 print(json.dumps(result, ensure_ascii=False), flush=True)
         elif args.command == "dart-job":
-            if args.file:
-                result = dart.collection_job("start", args.job_id, json.loads(Path(args.file).read_text()))
+            if args.file or args.resume:
+                if args.resume and not args.job_id:
+                    raise SystemExit("--resume requires --job-id")
+                result = dart.collection_job("start", args.job_id,
+                    json.loads(Path(args.file).read_text()) if args.file else None, args.retry_failed)
                 worker = dart.structured if result["job_id"].startswith("structured_") else dart.jobs
                 worker.thread.join()
                 result = dart.collection_job("status", result["job_id"], limit=args.limit)
