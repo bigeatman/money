@@ -51,7 +51,7 @@ def clean(value):
     """Never send account numbers or authentication secrets to the analysis tool."""
     if isinstance(value, dict):
         return {k: clean(v) for k, v in value.items()
-                if not any(t in k.lower() for t in ("acnt_no", "account_no", "secret", "token", "password", "appkey"))}
+                if not any(t in k.lower() for t in ("acnt_no", "account_no", "secret", "token", "password", "appkey", "api_key", "crtfc_key"))}
     if isinstance(value, list):
         return [clean(v) for v in value]
     if isinstance(value, Decimal):

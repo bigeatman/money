@@ -1,6 +1,12 @@
 {
   "capital_krw": "1000000",
   "max_positions": 10,
+  "opendart": {
+    "enabled": true,
+    "history_years": 3,
+    "disclosure_days": 365,
+    "interval_seconds": 3600
+  },
   "market_scan": {
     "batch_size": 50,
     "max_pages": 10000,

@@ -1,4 +1,5 @@
 import json
+import io
 from pathlib import Path
 import tempfile
 import threading
@@ -9,6 +10,8 @@ from unittest.mock import patch
 
 from money.common import clean
 from money.engine import Engine
+from money.dart_client import DartClient
+from money.fundamentals import Fundamentals
 from money.paper import PaperBroker
 from money.server import make_server
 from money.store import Store
@@ -45,7 +48,9 @@ class ServerTests(unittest.TestCase):
         _, data = self.rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         self.assertEqual({t["name"] for t in data["result"]["tools"]},
                          {"get_trading_snapshot", "submit_trading_plan", "get_execution_status",
-                          "start_market_scan", "get_market_scan", "get_market_context"})
+                          "start_market_scan", "get_market_scan", "get_market_context",
+                          "call_dart_api", "query_dart_data", "get_fundamentals", "get_fundamental_evidence",
+                          "manage_dart_collection", "record_dart_review"})
         _, data = self.rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                            "params": {"name": "get_execution_status", "arguments": {}}})
         self.assertFalse(data["result"]["isError"])
@@ -54,6 +59,31 @@ class ServerTests(unittest.TestCase):
     def test_notifications_are_accepted_without_body(self):
         code, body = self.rpc({"jsonrpc": "2.0", "method": "notifications/initialized"})
         self.assertEqual((code, body), (202, None))
+
+    def test_explicit_dart_job_and_attributed_review_round_trip_through_mcp(self):
+        client = DartClient("b" * 40, interval=0, opener=lambda *a, **k: io.BytesIO(b'{"status":"000","corp_code":"00126380"}'))
+        f = Fundamentals(Path(self.tmp.name) / "fundamentals.sqlite", client=client)
+        self.engine.fundamentals = f
+        def call(name, args):
+            _, out = self.rpc({"jsonrpc": "2.0", "id": 71, "method": "tools/call", "params": {"name": name, "arguments": args}})
+            self.assertFalse(out["result"].get("isError"), out)
+            return out["result"]["structuredContent"]
+        plan = {"companies": [{"symbol": "005930", "corp_code": "00126380"}],
+                "requests": [{"symbol": "005930", "corp_code": "00126380", "endpoint": "company.json", "params": {"corp_code": "00126380"}}],
+                "catalog": [{"id": "common_01", "title": "기업 구조"}]}
+        try:
+            out = call("manage_dart_collection", {"action": "start", "job_id": "mcp_fixture", "plan": plan})
+            f.jobs.thread.join(5)
+            out = call("manage_dart_collection", {"action": "status", "job_id": out["job_id"]})
+            self.assertTrue(out["collection_complete"])
+            source = out["rows"][0]["source_key"]
+            saved = call("record_dart_review", {"job_id": out["job_id"], "symbol": "005930", "items": [
+                {"item_id": "common_01", "status": "partial", "reason": "법인번호는 확인, 그룹 구조 원문 추가 검토 필요", "facts": {"corp_code": "00126380"}, "source_keys": [source]}]})
+            self.assertEqual(saved["stored"], 1)
+            reviews = call("manage_dart_collection", {"action": "status", "job_id": out["job_id"], "view": "reviews"})
+            self.assertEqual(reviews["rows"][0]["body"]["provenance"], "assistant_review")
+        finally:
+            f.close()
 
     def test_unauthorized_and_untrusted_origin_denied(self):
         for path, headers, expected in [("/mcp", {}, 401),
@@ -104,6 +134,46 @@ class ServerTests(unittest.TestCase):
                 read.assert_called_once_with(*expected)
         self.assertFalse(self.store.state["orders"])
         self.assertFalse(self.store.state["plans"])
+
+    def test_fundamental_tools_are_read_only_and_route_paged_cache_queries(self):
+        cases = [
+            ("call_dart_api", {"endpoint": "company.json", "params": {"corp_code": "00126380"}, "refresh": True},
+             "call_dart_api", ("company.json", {"corp_code": "00126380"}, True, False)),
+            ("get_fundamentals", {"symbol": "005930", "after_seq": 4, "through_seq": 9, "limit": 2},
+             "fundamental_report", ("005930", 4, 0, 2, 9)),
+            ("get_fundamental_evidence", {"source_key": "change:9", "offset": 8, "limit": 90},
+             "fundamental_evidence", ("change:9", 8, 90)),
+            ("query_dart_data", {"view": "fields", "source_key": "fixture", "field": "account_nm", "limit": 5},
+             "query_dart_data", ("fields", "fixture", None, None, "account_nm", None, 0, 5))]
+        for name, args, method, expected in cases:
+            with self.subTest(name=name), patch.object(self.engine, method, return_value={"read_only": True}) as read:
+                _, result = self.rpc({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": name, "arguments": args}})
+                self.assertFalse(result["result"]["isError"])
+                read.assert_called_once_with(*expected)
+        self.assertFalse(self.store.state["orders"])
+        self.assertFalse(self.store.state["plans"])
+
+    def test_direct_dart_bridge_persists_only_requested_response(self):
+        client = DartClient("b" * 40, interval=0)
+        cache = Fundamentals(Path(self.tmp.name) / "research.sqlite", client=client)
+        self.engine.fundamentals = cache
+        try:
+            payload = {"status": "000", "corp_code": "00126380", "acc_mt": "12"}
+            with patch.object(client, "get", return_value=payload) as api:
+                request = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+                    "name": "call_dart_api", "arguments": {"endpoint": "company.json",
+                    "params": {"corp_code": "00126380"}, "include_data": True}}}
+                _, first = self.rpc(request)
+                self.assertFalse(first["result"]["isError"])
+                self.assertEqual(first["result"]["structuredContent"]["data"], payload)
+                _, second = self.rpc(request)
+                self.assertTrue(second["result"]["structuredContent"]["cache_hit"])
+                api.assert_called_once_with("company.json", {"corp_code": "00126380"})
+            self.assertEqual(cache.status()["pending_sources"], 0)
+            self.assertFalse(self.store.state["orders"])
+        finally:
+            cache.close()
 
 
 if __name__ == "__main__":

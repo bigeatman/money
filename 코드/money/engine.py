@@ -13,12 +13,13 @@ ACTIVE = {"sending", "unknown", "open", "cancel_requested"}
 
 
 class Engine:
-    def __init__(self, store, broker, config, clock=now, scanner=None):
+    def __init__(self, store, broker, config, clock=now, scanner=None, fundamentals=None):
         self.store, self.broker, self.config, self.clock = store, broker, config, clock
         self.s = store.state
         self.lock = threading.RLock()
         self.accounts = {}
         self.scanner = scanner
+        self.fundamentals = fundamentals
         self.s.setdefault("targets", {})
         binding = {"mode": broker.mode, "accounts": broker.binding() if hasattr(broker, "binding") else {}}
         old_binding = self.s.get("binding")
@@ -711,6 +712,8 @@ class Engine:
     def execution_capabilities(self):
         caps = dict(self.broker.execution_capabilities()) if hasattr(self.broker, "execution_capabilities") else {}
         caps["market_scanner"] = self.scanner.capabilities() if self.scanner is not None else {"supported": False}
+        caps["fundamentals"] = (self.fundamentals.capabilities()
+                                if self.fundamentals is not None else {"supported": False})
         caps["kr_preopen_buys"] = {"supported": True, "exchange": "KRX", "minutes_before_open": 30,
             "order_types": ["LIMIT", "MARKET"], "opt_in": "preopen=true",
             "market_reservation": "daily upper_limit times quantity including buy fees; buy_limit must cover upper_limit",
@@ -723,6 +726,38 @@ class Engine:
             "kr_day_orders": "reconcile dated broker history before replacing expired orders",
             "us_prior_unresolved_orders": "blocked until explicit broker reconciliation; today-only API"}
         return caps
+
+    def call_dart_api(self, endpoint, params=None, refresh=False, include_data=False):
+        if self.fundamentals is None:
+            raise ValueError("OpenDART is not configured")
+        return self.fundamentals.call_api(endpoint, params, refresh, include_data)
+
+    def fundamental_report(self, symbol=None, after_seq=None, offset=0, limit=20, through_seq=None):
+        if self.fundamentals is None:
+            raise ValueError("OpenDART collector is not configured")
+        return self.fundamentals.report(symbol, after_seq, offset, limit, through_seq)
+
+    def fundamental_evidence(self, source_key, offset=0, limit=4000):
+        if self.fundamentals is None:
+            raise ValueError("OpenDART collector is not configured")
+        return self.fundamentals.evidence(source_key, offset, limit)
+
+    def query_dart_data(self, view="sources", source_key=None, corp_code=None, endpoint=None,
+                        field=None, text=None, offset=0, limit=20):
+        if self.fundamentals is None:
+            raise ValueError("OpenDART is not configured")
+        return self.fundamentals.query_data(view, source_key, corp_code, endpoint, field, text, offset, limit)
+
+    def manage_dart_collection(self, action, job_id=None, plan=None, retry_failed=False,
+                               view="requests", symbol=None, offset=0, limit=20):
+        if self.fundamentals is None:
+            raise ValueError("OpenDART storage unavailable")
+        return self.fundamentals.collection_job(action, job_id, plan, retry_failed, view, symbol, offset, limit)
+
+    def record_dart_review(self, job_id, symbol, items):
+        if self.fundamentals is None:
+            raise ValueError("OpenDART storage unavailable")
+        return self.fundamentals.record_review(job_id, symbol, items)
 
     def diagnostic(self, part, date=None):
         """Independent read-only US queries for an operator; no plans or orders."""
