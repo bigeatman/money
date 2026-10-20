@@ -144,6 +144,10 @@ def calculated(payload, endpoint):
         rows = [payload]
     if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
         raise DartError("invalid_structured_rows")
+    if payload.get("status") == "000" and not rows:
+        raise DartError("invalid_structured_rows")
+    if payload.get("status") == "013" and rows:
+        raise DartError("invalid_structured_rows")
     output = []
     for record in rows:
         numbers = {key: str(number) if (number := amount(value)) is not None else None
@@ -300,6 +304,13 @@ class StructuredCollector:
             if endpoint == "company.json" and rows and symbol and payload.get("corp_name"):
                 db.execute("INSERT OR REPLACE INTO issuers VALUES (?,?,?,NULL,1,?)",
                            (corp, symbol, payload["corp_name"], dumps(payload)))
+            # Keep the established get_fundamentals financial/company reader
+            # usable while retaining the exact request key for deduplication.
+            if endpoint == "company.json":
+                self.f._save(db, "company:" + corp, corp, payload, availability, request_key=key)
+            elif endpoint == "fnlttSinglAcntAll.json":
+                alias = "financial:" + ":".join(str(params[k]) for k in ("corp_code", "bsns_year", "reprt_code", "fs_div"))
+                self.f._save(db, alias, corp, payload, availability, request_key=key)
             return availability, len(rows), derived
         return availability, 0, None
 

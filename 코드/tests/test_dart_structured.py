@@ -119,6 +119,7 @@ class StructuredTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT COUNT(*) FROM structured_calculations").fetchone()[0], 4)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM issuers").fetchone()[0], 1)
         self.assertTrue(self.f.verify_archive(limit=100)["all_ok"])
+        self.assertEqual(len(self.f.report("005930")["rows"]), 4)
         calls = len(self.provider.calls)
         again = self.run_job(self.plan)
         self.assertEqual(len(self.provider.calls), calls)
@@ -188,6 +189,20 @@ class StructuredTests(unittest.TestCase):
         self.provider.override = None
         self.assertTrue(self.run_job(job_id=out["job_id"], retry_failed=True)["collection_complete"])
         self.assertEqual(len(self.provider.calls), 2)
+
+    def test_empty_success_is_a_failure_and_no_data_is_not_zero(self):
+        self.plan.update(apis=["D5"], report_codes=["11011"])
+        self.provider.override = lambda e, p: {"status": "000"}
+        out = self.run_job(self.plan)
+        self.assertFalse(out["collection_complete"])
+        self.assertEqual(out["rows"][0]["error"], "invalid_structured_rows")
+        self.provider.override = None
+        out = self.run_job(job_id=out["job_id"], retry_failed=True)
+        self.assertTrue(out["collection_complete"], out)
+        with self.f.db() as db:
+            row = json.loads(db.execute("SELECT body FROM structured_rows").fetchone()[0])
+        self.assertIsNone(row["numeric"]["sm"])
+        self.assertEqual(row["numeric"]["jan_salary_am"], "0")
 
     def test_quota_pauses_and_resume_reuses_durable_successes(self):
         self.plan.update(apis=["D4"], workers=1)

@@ -526,6 +526,7 @@ class Fundamentals:
                 "legacy_versions_pending": unarchived, "checksum": "sha256",
                 "directory": str(self.archive.root), "capture_exact_http_bodies": True},
             "explicit_collection_jobs": True, "review_records": True,
+            "structured_collection": True, "structured_D3_excluded": True,
             "stock_raw_folders": True,
             "coverage": {"universe": "explicitly requested API responses; previous issuer cache preserved",
                 "financial_years": None, "bases": None,
