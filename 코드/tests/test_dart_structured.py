@@ -269,6 +269,25 @@ class StructuredTests(unittest.TestCase):
         self.assertEqual(out["capacity"]["sqlite_concurrent_writers"], 1)
         self.assertEqual(self.provider.calls, [])
 
+    def test_auditor_unknown_year_is_preserved_and_real_scope_mismatch_rejected(self):
+        self.plan.update(apis=["D10"], report_codes=["11011"])
+        def audit_row(year):
+            return {"status": "000", "list": [{"corp_code": "00164742", "bsns_year": year,
+                "adtor": "-", "adt_reprt_spcmnt_matter": "-", "stlm_dt": "2025-12-31"}]}
+        self.plan["companies"] = [{"symbol": "005380", "corp_code": "00164742"}]
+        self.provider.override = lambda e, p: audit_row("-")
+        out = self.run_job(self.plan)
+        self.assertTrue(out["collection_complete"], out)
+        with self.f.db() as db:
+            stored = json.loads(db.execute("SELECT body FROM structured_rows").fetchone()[0])
+        self.assertEqual(stored["provider"]["bsns_year"], "-")
+        self.assertEqual(stored["provider"]["adtor"], "-")
+        self.assertNotIn("adt_opinion", stored["provider"])
+        self.provider.override = lambda e, p: audit_row("2024")
+        changed = self.run_job({**self.plan, "refresh": True})
+        self.assertFalse(changed["collection_complete"])
+        self.assertEqual(changed["rows"][0]["error"], "response_scope_mismatch")
+
     def test_local_device_benchmark_runs_real_pipeline_and_persists_summary_only(self):
         with patch("money.fundamentals.benchmark_capacity", side_effect=lambda directory: benchmark_capacity(directory, [2])):
             out = self.f.collection_job("status", plan={"mode": "capacity", "benchmark": True})

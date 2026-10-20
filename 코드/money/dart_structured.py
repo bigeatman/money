@@ -282,6 +282,11 @@ class StructuredCollector:
             for index, value in enumerate(rows):
                 record = value["provider"]
                 for field in ("corp_code", "bsns_year", "reprt_code", "fs_div"):
+                    # Audit rows can explicitly leave the displayed year blank.
+                    # Preserve the marker; it is unknown, not a different year.
+                    if (endpoint == "accnutAdtorNmNdAdtOpinion.json" and field == "bsns_year"
+                            and record.get(field) in (None, "", "-")):
+                        continue
                     if field in params and field in record and str(record[field]) != str(params[field]):
                         raise DartError("response_scope_mismatch")
                 if symbol and record.get("stock_code") and record["stock_code"] != symbol:
